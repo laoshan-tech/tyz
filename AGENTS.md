@@ -86,7 +86,10 @@ billing authorization: the sample's service string is attacker-controlled, so a
   write-back carries the same gate, reads current statuses in chunked SELECTs
   (D1 param cap) and only issues UPDATEs on actual transitions
 D1 chunking: every batched write/IN-list is chunked to stay under D1's 100 bound
-  parameters per statement (stats insert 20 rows, health upsert 16, IN lists 90) —
+  parameters per statement (stats insert 20 rows, health upsert 16, IN lists 90; the traffic
+  ingest writes are MULTI-ROW upserts — traffic_hourly 12 rows @8 params, traffic_counters
+  16 @5, service_metrics_hourly 16 @6, per-rule observation increments as one CASE-based
+  UPDATE per 16-rule chunk — so the ingest's statement count is O(chunks), not O(services)) —
   the observer reports per (service × client), so one flush easily carries dozens of
   samples; the agent likewise uploads in 20-sample chunks, trimming the sent prefix
   on partial failure so an oversized batch can never wedge the retry loop. Enqueue
@@ -218,6 +221,6 @@ Biome (root `biome.json`) covers the TS workspaces: double quotes, 120 cols, org
 
 Live two-agent e2e (needs `wrangler dev` + seed): `apps/agent/scripts/e2e-local.sh` — re-applies the seed (single-hop tunnel-1; two-node relay tunnel-2 sharing the exit's :16900; raw tunnel-3 with per-rule port pairs 16556→26556 / 16557→26557; TLS relay tunnel-4 over grpc on :16901 with platform certs — the seed sets `tls_domain=relay.local.test` and drops `tls_material` so every run issues fresh certs), builds the agent, starts two local HTTP targets and two agent processes, and asserts distinguishable responses through every entry port plus that a plaintext probe on the TLS listener is refused.
 
-Server-side e2e (needs `wrangler dev` running): `bun run scripts/test-ws-push.ts` (inside apps/server) — bad token rejected, hello, ping/pong, admin write broadcasts `config_changed`. Uses seed token `dev-token-1`; the script bootstraps the admin account (admin/admin123) through `POST /api/setup` when the local database is still uninitialized. Unit tests: `apps/server/test/crypto.test.ts` (salted-sha256 round-trip) and `apps/server/test/tls.test.ts`. TS workspaces keep tests OUT of `src/` (bun discovers them under `<workspace>/test/`; tsc only includes `src/` — `bun:test` has no type declarations).
+Server-side e2e (needs `wrangler dev` running): `bun run scripts/test-ws-push.ts` (inside apps/server) — bad token rejected, hello, ping/pong, admin write broadcasts `config_changed`. Uses seed token `dev-token-1`; the script bootstraps the admin account (admin/admin123) through `POST /api/setup` when the local database is still uninitialized. Unit tests: `apps/server/test/crypto.test.ts` (salted-sha256 round-trip), `apps/server/test/tls.test.ts`, and `apps/server/test/traffic.test.ts` (ledger ingest vs a bun:sqlite database loaded from the real D1 migration — delta chaining, counter resets, chunk-boundary splits, forged-service gate). TS workspaces keep tests OUT of `src/` (bun discovers them under `<workspace>/test/`; tsc only includes `src/` — `bun:test` has no type declarations).
 
 For a full local stack run `wrangler dev` + seed + the Go agent (`bun run dev:agent`); send traffic through a rule's listen port and watch `gost_stats` rows appear.

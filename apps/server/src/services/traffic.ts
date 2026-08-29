@@ -11,6 +11,13 @@ import {
   tunnels,
 } from "../db/schema";
 
+/** Chunk under D1's 100 bound parameters per statement (see routes/agent.ts). */
+function chunk<T>(rows: T[], size: number): T[][] {
+  const parts: T[][] = [];
+  for (let i = 0; i < rows.length; i += size) parts.push(rows.slice(i, i + size));
+  return parts;
+}
+
 /**
  * Tunnels on which the node deploys per-rule services (service-{ruleId}):
  * every IN-chain node (entries, both modes) and OUT-chain nodes of RAW tunnels
@@ -192,23 +199,27 @@ export async function ingestTraffic(
   // Ledger first (see the file comment for the crash-ordering rationale) —
   // billing stays authoritative; the observation columns below are best
   // effort and a crash between the two only loses display bytes.
+  // All multi-row upserts are chunked under D1's 100 bound parameters per
+  // statement (traffic_hourly rows bind 8, traffic_counters 5); the Maps are
+  // key-deduped, so no statement repeats a conflict target.
   if (buckets.size > 0) {
     // The node's billing rate: charged bytes = round(real x rate).
     const node = await db.select({ rate: relayNodes.rate }).from(relayNodes).where(eq(relayNodes.id, nodeId)).get();
     const rate = node?.rate ?? 1.0;
-    for (const b of buckets.values()) {
+    const hourlyRows = [...buckets.values()].map((b) => ({
+      rule_id: b.ruleId,
+      user_id: b.userId,
+      node_id: nodeId,
+      hour_ts: b.hourTs,
+      real_upload: b.upload,
+      real_download: b.download,
+      billed_upload: Math.round(b.upload * rate),
+      billed_download: Math.round(b.download * rate),
+    }));
+    for (const part of chunk(hourlyRows, 12)) {
       await db
         .insert(trafficHourly)
-        .values({
-          rule_id: b.ruleId,
-          user_id: b.userId,
-          node_id: nodeId,
-          hour_ts: b.hourTs,
-          real_upload: b.upload,
-          real_download: b.download,
-          billed_upload: Math.round(b.upload * rate),
-          billed_download: Math.round(b.download * rate),
-        })
+        .values(part)
         .onConflictDoUpdate({
           target: [trafficHourly.rule_id, trafficHourly.hour_ts],
           set: {
@@ -220,10 +231,17 @@ export async function ingestTraffic(
         });
     }
   }
-  for (const [service, c] of counterUpdates) {
+  const counterRows = [...counterUpdates].map(([service, c]) => ({
+    node_id: nodeId,
+    service,
+    upload: c.upload,
+    download: c.download,
+    updated_at: now,
+  }));
+  for (const part of chunk(counterRows, 16)) {
     await db
       .insert(trafficCounters)
-      .values({ node_id: nodeId, service, upload: c.upload, download: c.download, updated_at: now })
+      .values(part)
       .onConflictDoUpdate({
         target: [trafficCounters.node_id, trafficCounters.service],
         set: { upload: sql`excluded.upload`, download: sql`excluded.download`, updated_at: sql`excluded.updated_at` },
@@ -232,15 +250,31 @@ export async function ingestTraffic(
 
   // Observation counters: per-rule (sums every node's leg) and per-node (all
   // services, shared exits included). Plain increments — resettable without
-  // touching the ledger above.
-  for (const b of buckets.values()) {
+  // touching the ledger above. Per-rule deltas differ, so they ride a CASE over
+  // the chunk's ids: one UPDATE per chunk instead of per rule (5 params/rule,
+  // and the UPDATE no-ops rows that vanished — unlike an upsert, which would
+  // resurrect a deleted rule).
+  for (const part of chunk([...buckets.values()], 16)) {
+    const upCase = sql.join(
+      part.map((b) => sql`WHEN ${b.ruleId} THEN ${b.upload}`),
+      sql` `,
+    );
+    const downCase = sql.join(
+      part.map((b) => sql`WHEN ${b.ruleId} THEN ${b.download}`),
+      sql` `,
+    );
     await db
       .update(relayRules)
       .set({
-        upload_traffic: sql`${relayRules.upload_traffic} + ${b.upload}`,
-        download_traffic: sql`${relayRules.download_traffic} + ${b.download}`,
+        upload_traffic: sql`${relayRules.upload_traffic} + CASE ${relayRules.id} ${upCase} ELSE 0 END`,
+        download_traffic: sql`${relayRules.download_traffic} + CASE ${relayRules.id} ${downCase} ELSE 0 END`,
       })
-      .where(eq(relayRules.id, b.ruleId));
+      .where(
+        inArray(
+          relayRules.id,
+          part.map((b) => b.ruleId),
+        ),
+      );
   }
   if (nodeIngress > 0 || nodeEgress > 0) {
     await db
@@ -269,17 +303,23 @@ async function rollupServiceMetrics(db: Database, nodeId: number, serviceSamples
     cur.connMax = Math.max(cur.connMax, s.currentConns);
     agg.set(s.service, cur);
   }
-  for (const [service, m] of agg) {
+  // 6 bound params per row — 16 per statement stays under D1's 100 cap.
+  for (const part of chunk(
+    [...agg.entries()].map(([service, m]) => ({ service, m })),
+    16,
+  )) {
     await db
       .insert(serviceMetricsHourly)
-      .values({
-        node_id: nodeId,
-        service,
-        hour_ts: hourTs,
-        samples: m.samples,
-        conn_sum: m.connSum,
-        conn_max: m.connMax,
-      })
+      .values(
+        part.map(({ service, m }) => ({
+          node_id: nodeId,
+          service,
+          hour_ts: hourTs,
+          samples: m.samples,
+          conn_sum: m.connSum,
+          conn_max: m.connMax,
+        })),
+      )
       .onConflictDoUpdate({
         target: [serviceMetricsHourly.node_id, serviceMetricsHourly.service, serviceMetricsHourly.hour_ts],
         set: {
