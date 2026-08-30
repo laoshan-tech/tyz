@@ -1,0 +1,7 @@
+# The realm ecosystem builds on nightly: realm_lb uses `unchecked_math` and
+# kaminari uses `impl_trait_in_assoc_type`. Pinned to a dated nightly for
+# reproducible release builds (bump deliberately, with `cargo test`).
+[toolchain]
+channel = "nightly-2026-08-28"
+profile = "minimal"
+components = ["clippy"]

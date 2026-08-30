@@ -12,37 +12,50 @@ jobs:
     permissions:
       contents: write # attach assets to the release
 
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            asset: linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            asset: linux-arm64
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
+      # rustup reads apps/agent/rust-toolchain.toml and installs the pinned
+      # nightly automatically; the arm64 job cross-compiles against the
+      # distro's ARM64 toolchain (no emulation — same recipe as the
+      # apps/agent Dockerfile).
+      - name: Install cross toolchain (arm64 only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
 
-      # Same build flags as apps/agent/Dockerfile (CGO_ENABLED=0 -trimpath
-      # -ldflags "-s -w"), cross-compiled for the platforms the image is
-      # built for, with the release tag stamped into the binary
-      # (-X main.version). Assets land on the release as
-      # tyz-agent-<tag>-<os>-<arch>.tar.gz + a checksums file.
-      - name: Build agent binaries
+      # The release tag is stamped into the binary (TYZ_VERSION, src/lib.rs).
+      # Assets land on the release as tyz-agent-<tag>-<os>-<arch>.tar.gz +
+      # a checksums file.
+      - name: Build agent binary
+        working-directory: apps/agent
+        env:
+          TYZ_VERSION: ${{ github.ref_name }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           out="${RUNNER_TEMP}/dist"
-          mkdir -p "$out"
-          cd apps/agent
-          for target in linux/amd64 linux/arm64; do
-            os="${target%/*}"
-            arch="${target#*/}"
-            name="tyz-agent-${tag}-${os}-${arch}"
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-              go build -trimpath -ldflags "-s -w -X main.version=${tag}" -o "$out/${name}/tyz-agent" .
-            tar -czf "$out/${name}.tar.gz" -C "$out/${name}" tyz-agent
-            rm -r "$out/${name}"
-          done
-          (cd "$out" && sha256sum -- *.tar.gz > "tyz-agent-${tag}-checksums.txt")
+          cargo build --release --locked --target "${{ matrix.target }}"
+          name="tyz-agent-${tag}-${{ matrix.asset }}"
+          mkdir -p "${out}/${name}"
+          cp "target/${{ matrix.target }}/release/tyz-agent" "${out}/${name}/"
+          tar -czf "${out}/${name}.tar.gz" -C "${out}/${name}" tyz-agent
+          rm -r "${out}/${name}"
+
+      - name: Checksums
+        working-directory: ${{ runner.temp }}/dist
+        run: sha256sum -- *.tar.gz > "tyz-agent-${GITHUB_REF_NAME}-checksums.txt"
 
       - name: Attach binaries to the release
         env:

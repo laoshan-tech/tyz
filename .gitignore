@@ -34,5 +34,13 @@ Thumbs.db
 *.pid
 
 # Local artifacts
-generated-gost-config.json
 last-config.json
+
+# Rust agent (apps/agent) — build output only. Cargo.lock IS committed on
+# purpose (application crate: pinned deps — including realm_lb's git rev —
+# keep release builds reproducible).
+target/
+**/*.rs.bk
+# Platform link-TLS PEMs written by the rust agent into its working directory
+# (secrets — never commit).
+apps/agent/certs/

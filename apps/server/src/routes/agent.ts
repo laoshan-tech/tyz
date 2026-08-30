@@ -1,11 +1,13 @@
 import { agentStatsBatchSchema, RelayRuleStatus } from "@tyz/shared";
 import { and, eq, inArray, ne, sql } from "drizzle-orm";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { createDb } from "../db";
 import { getNodeConfigSnapshot, recomputeNodeConfig } from "../db/repo";
 import { gostStats, relayRules, serviceHealth } from "../db/schema";
 import type { Bindings, Variables } from "../env";
 import { nodeAuth } from "../middleware/nodeAuth";
+import { quotaSweepStoppedUsers } from "../services/quota";
+import { recomputeUserNodes } from "../services/recompute";
 import { ingestTraffic, nodeRuleTunnels } from "../services/traffic";
 
 export const agentRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
@@ -75,6 +77,24 @@ function chunk<T>(rows: T[], size: number): T[][] {
   return out;
 }
 
+/**
+ * Flush-driven quota hard-stop (the R4 mitigation — see
+ * services/quota.ts::quotaSweepStoppedUsers): the realm payload carries no
+ * in-agent quota gate, so exhaustion enforcement is config removal. Runs AFTER
+ * the response (waitUntil, mirroring admin's deferRecompute); failures are
+ * logged and self-heal — the next flush retries while the rules are still
+ * deployed, and the daily cron remains the backstop.
+ */
+function scheduleQuotaSweep(c: Context<{ Bindings: Bindings; Variables: Variables }>, billedRuleIds: number[]): void {
+  if (billedRuleIds.length === 0) return;
+  c.executionCtx.waitUntil(
+    (async () => {
+      const users = await quotaSweepStoppedUsers(createDb(c.env.DB), billedRuleIds);
+      await Promise.all(users.map((userId) => recomputeUserNodes(c.env, userId)));
+    })().catch((err) => console.error("quota sweep failed", err)),
+  );
+}
+
 /** Batched stats upload from agents (samples and/or service health snapshot). */
 agentRoutes.post("/stats", async (c) => {
   const parsed = agentStatsBatchSchema.safeParse(await c.req.json().catch(() => null));
@@ -102,10 +122,15 @@ agentRoutes.post("/stats", async (c) => {
       await db.insert(gostStats).values(part);
     }
     // Fold the samples into the hourly ledger (billing source of truth).
-    // Best effort: a failed ingest must not fail the stats upload.
-    await ingestTraffic(db, nodeId, parsed.data.samples, ruleTunnels).catch((err) =>
-      console.error("traffic ledger ingest failed", err),
-    );
+    // Best effort: a failed ingest must not fail the stats upload (the sweep
+    // is skipped for that batch; the next flush covers it).
+    let billedRuleIds: number[] = [];
+    await ingestTraffic(db, nodeId, parsed.data.samples, ruleTunnels)
+      .then((ruleIds) => {
+        billedRuleIds = ruleIds;
+      })
+      .catch((err) => console.error("traffic ledger ingest failed", err));
+    scheduleQuotaSweep(c, billedRuleIds);
   }
 
   // The health array is a full snapshot of the node's services: upsert every

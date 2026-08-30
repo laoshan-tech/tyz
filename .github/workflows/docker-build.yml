@@ -73,7 +73,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ steps.agentver.outputs.version }}
+            TYZ_VERSION=${{ steps.agentver.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false

@@ -8,14 +8,6 @@
   "files": {
     "includes": ["**", "!!**/dist", "!!examples", "!!**/.wrangler"]
   },
-  "overrides": [
-    {
-      "includes": ["apps/agent/internal/builder/testdata/*-golden-*.json"],
-      "formatter": {
-        "enabled": false
-      }
-    }
-  ],
   "formatter": {
     "enabled": true,
     "indentStyle": "space"

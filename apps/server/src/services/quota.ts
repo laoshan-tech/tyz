@@ -1,7 +1,7 @@
 import type { Package, QuotaDecision, RelayRule, RuleQuotaStatus, User, UserSubscription } from "@tyz/shared";
 import { and, eq, gte, inArray, sql } from "drizzle-orm";
 import type { Database } from "../db";
-import { packages, trafficHourly, userPackages, users } from "../db/schema";
+import { nodeConfigs, packages, relayRules, trafficHourly, userPackages, users } from "../db/schema";
 import { hourFloorIso } from "./traffic";
 
 /**
@@ -81,15 +81,26 @@ export async function getUserStatuses(db: Database, userIds: number[]): Promise<
  * included: a conservative, one-time-per-window overcount that never
  * over-delivers allowance. Rules deleted mid-window keep their ledger rows (no
  * FK by design) but stop counting the moment they leave relay_rules.
+ *
+ * Built with the query builder, NOT raw `db.get(sql…)` — the D1 driver maps
+ * that to a row object but the bun:sqlite driver (tests) to a bare value
+ * array, which silently reads as 0. The builder path maps identically on both.
  */
 async function userUsageBytes(db: Database, userId: number, sinceIso: string): Promise<number> {
-  const result = (await db.get(sql`
-    SELECT COALESCE(SUM(billed_upload + billed_download), 0) AS used
-    FROM traffic_hourly
-    WHERE hour_ts >= ${hourFloorIso(sinceIso)}
-      AND rule_id IN (SELECT id FROM relay_rules WHERE user_id = ${userId})
-  `)) as { used: number | null } | undefined;
-  return Number(result?.used ?? 0);
+  const used = sql<number>`COALESCE(SUM(${trafficHourly.billed_upload} + ${trafficHourly.billed_download}), 0)`;
+  const rows = await db
+    .select({ used })
+    .from(trafficHourly)
+    .where(
+      and(
+        gte(trafficHourly.hour_ts, hourFloorIso(sinceIso)),
+        inArray(
+          trafficHourly.rule_id,
+          db.select({ id: relayRules.id }).from(relayRules).where(eq(relayRules.user_id, userId)),
+        ),
+      ),
+    );
+  return Number(rows[0]?.used ?? 0);
 }
 
 /**
@@ -185,6 +196,59 @@ export async function applyRuleQuotas(db: Database, rules: RelayRule[]): Promise
     out.push(decision.quota ? { ...rule, quota: decision.quota } : rule);
   }
   return out;
+}
+
+/**
+ * Flush-driven hard-stop sweep (the R4 mitigation — see
+ * docs/agent-realm-rust-refactor.md): the realm payload carries no in-agent
+ * quota gate, so enforcement is config removal, which without this sweep
+ * waited for the daily cron (up to a cron period of over-delivery). The stats
+ * flush hands us the rule ids that just reported billed traffic; this resolves
+ * their owners' hard-stop decisions and returns the users whose rules are
+ * STILL deployed in some node config — the caller recomputes + notifies those
+ * users' nodes, shrinking the over-delivery window to one flush interval.
+ *
+ * Idempotent per user: once the rules are out of every config, the deployment
+ * scan short-circuits and later flushes (stale buffered samples, a slow agent
+ * still reporting removed services) cost one indexed query. `stopped` covers
+ * every hard-stop reason: the non-traffic reasons (disabled / expired / no
+ * subscription) change via admin writes that already recompute, so reaching
+ * this sweep for them means a previous recompute failed — the retry here is
+ * pure self-heal, and the daily cron remains the backstop.
+ */
+export async function quotaSweepStoppedUsers(db: Database, ruleIds: number[]): Promise<number[]> {
+  if (ruleIds.length === 0) return [];
+  const ownerIds = new Set<number>();
+  for (let i = 0; i < ruleIds.length; i += 90) {
+    const rows = await db
+      .select({ user_id: relayRules.user_id })
+      .from(relayRules)
+      .where(inArray(relayRules.id, ruleIds.slice(i, i + 90)));
+    for (const r of rows) {
+      if (r.user_id !== null) ownerIds.add(r.user_id);
+    }
+  }
+  if (ownerIds.size === 0) return [];
+  const decisions = await quotaDecisionsForUsers(db, [...ownerIds]);
+  const stopped = [...ownerIds].filter((id) => decisions.get(id)?.stopped === true);
+  if (stopped.length === 0) return [];
+
+  // Still deployed somewhere? The snapshot table is tiny (one row per node)
+  // and JSON.stringify is compact, so the `"name":"service-{id}"` needle is
+  // exact (the closing quote rules out rule-id prefix collisions).
+  const ruleRows = await db
+    .select({ id: relayRules.id, user_id: relayRules.user_id })
+    .from(relayRules)
+    .where(inArray(relayRules.user_id, stopped));
+  const snapshots = await db.select({ config_json: nodeConfigs.config_json }).from(nodeConfigs);
+  const deployed = new Set<number>();
+  for (const rule of ruleRows) {
+    if (rule.user_id === null) continue; // unreachable via the IN(user ids) filter; satisfies the type
+    if (deployed.has(rule.user_id)) continue;
+    const needle = `"name":"service-${rule.id}"`;
+    if (snapshots.some((s) => s.config_json.includes(needle))) deployed.add(rule.user_id);
+  }
+  return [...deployed];
 }
 
 /** Admin-facing usage summary for one user. */

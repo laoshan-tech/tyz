@@ -65,6 +65,33 @@ export const tlsMaterialSchema = z.object({
   client_key: z.string().min(1),
 });
 
+// ---- Realm agent payload (docs/agent-realm-rust-refactor.md §7.2) ----
+
+export const realmTargetSchema = z.object({
+  host: z.string().min(1),
+  port: z.number().int().min(1).max(65535),
+});
+
+export const realmServiceSchema = z.object({
+  name: z.string().min(1),
+  listen_host: z.string().min(1),
+  listen_port: z.number().int().min(1).max(65535),
+  target_host: z.string().min(1),
+  target_port: z.number().int().min(1).max(65535),
+  extra_targets: z.array(realmTargetSchema).optional(),
+  balance: z.enum(["roundrobin", "iphash"]).optional(),
+  tls_side: z.enum(["listen", "connect"]).optional(),
+  alpn: z.array(z.string()).optional(),
+  connect_timeout_s: z.number().int().positive().optional(),
+});
+
+export const realmNodeConfigSchema = z.object({
+  agent: z.literal("realm"),
+  node: z.object({ id: z.number().int(), name: z.string() }),
+  services: z.array(realmServiceSchema),
+  tls_material: tlsMaterialSchema.optional(),
+});
+
 // ---- Agent-facing payloads (config delivered to a node) ----
 
 export const relayNodePayloadSchema = z.object({

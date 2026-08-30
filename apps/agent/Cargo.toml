@@ -1,0 +1,51 @@
+[package]
+name = "tyz-agent"
+version = "0.1.0"
+edition = "2021"
+description = "TYZ relay node agent: realm-based Rust data plane (config sync + traffic stats)"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "signal",
+    "sync",
+    "fs",
+] }
+tokio-util = "0.7"
+futures-util = "0.3"
+
+# control plane
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# realm ecosystem (docs/agent-realm-rust-refactor.md §6)
+realm_io = { version = "0.5", features = ["statistic", "brutal-shutdown"] }
+# Upstream fix (wrapping arithmetic, #172) merged at 51c0413 but unreleased on
+# crates.io at pin time — track the commit until a version is published, then
+# switch back to a plain version requirement.
+realm_lb = { git = "https://github.com/zhboner/realm", rev = "51c0413d5ee77fd868586c0d7b54ad45692e783f" }
+kaminari = { version = "0.14", default-features = false, features = ["mix", "tls-ring"] }
+
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
+rand = "0.8"
+dotenvy = "0.15"
+
+[dev-dependencies]
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+http-body-util = "0.1"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+
+[profile.release]
+strip = true
+lto = true

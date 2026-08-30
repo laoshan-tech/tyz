@@ -1,15 +1,7 @@
-import { ChainType, ForwardMode, type GostStatsSample } from "@tyz/shared";
+import { ChainType, type GostStatsSample } from "@tyz/shared";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Database } from "../db";
-import {
-  chains,
-  relayNodes,
-  relayRules,
-  serviceMetricsHourly,
-  trafficCounters,
-  trafficHourly,
-  tunnels,
-} from "../db/schema";
+import { chains, relayNodes, relayRules, serviceMetricsHourly, trafficCounters, trafficHourly } from "../db/schema";
 
 /** Chunk under D1's 100 bound parameters per statement (see routes/agent.ts). */
 function chunk<T>(rows: T[], size: number): T[][] {
@@ -20,13 +12,12 @@ function chunk<T>(rows: T[], size: number): T[][] {
 
 /**
  * Tunnels on which the node deploys per-rule services (service-{ruleId}):
- * every IN-chain node (entries, both modes) and OUT-chain nodes of RAW tunnels
- * (raw exits deploy one service per rule). Multi-leg usage is INTENTIONALLY the
- * sum over every node serving the rule — the operator trims legs via each
- * node's rate (0 = record but don't bill). Relay-mode exits deploy only the
- * shared service-t{tunnelId} (their observer data carries no per-rule split),
- * so a service-{ruleId} sample from them is a forged name and is rejected.
- * Used as the billing/status authorization set.
+ * every IN-chain node (entries) and every OUT-chain node (exits). The realm
+ * agent renders per-rule port pairs on BOTH ends of every tunnel (raw
+ * semantics — the legacy relay forward_mode is retired), so multi-leg usage
+ * is INTENTIONALLY the sum over every node serving the rule; operators trim
+ * legs via each node's rate (0 = record but don't bill). Used as the
+ * billing/status authorization set.
  */
 export async function nodeRuleTunnels(db: Database, nodeId: number): Promise<Set<number>> {
   const nodeChains = await db
@@ -34,20 +25,8 @@ export async function nodeRuleTunnels(db: Database, nodeId: number): Promise<Set
     .from(chains)
     .where(eq(chains.node_id, nodeId));
   const ruleTunnels = new Set<number>();
-  const outTunnels: number[] = [];
   for (const c of nodeChains) {
-    if (c.chain_type === ChainType.IN) ruleTunnels.add(c.tunnel_id);
-    else if (c.chain_type === ChainType.OUT) outTunnels.push(c.tunnel_id);
-  }
-  if (outTunnels.length > 0) {
-    // Stored mode only: the admin API rejects raw on non-1/2-hop shapes, so a
-    // hand-edited invalid raw tunnel degrades to relay at aggregation and its
-    // exit's per-rule reports are (harmlessly) over-permitted here.
-    const rows = await db
-      .select({ id: tunnels.id })
-      .from(tunnels)
-      .where(and(inArray(tunnels.id, outTunnels), eq(tunnels.forward_mode, ForwardMode.RAW)));
-    for (const r of rows) ruleTunnels.add(r.id);
+    if (c.chain_type === ChainType.IN || c.chain_type === ChainType.OUT) ruleTunnels.add(c.tunnel_id);
   }
   return ruleTunnels;
 }
@@ -90,6 +69,10 @@ interface HourBucket {
  * see POST /rules/:id/reset-traffic). Multi-node rule usage is the SUM over
  * every node serving the rule: raw-mode exits report under the same
  * service-{ruleId} name as the entry.
+ *
+ * Returns the distinct rule ids that received a billed delta this batch
+ * (authorization-gated, service-level rows only) — the input of the
+ * flush-driven quota sweep (quotaSweepStoppedUsers).
  */
 export async function ingestTraffic(
   db: Database,
@@ -97,10 +80,10 @@ export async function ingestTraffic(
   samples: GostStatsSample[],
   /** Pre-fetched per-rule tunnels (nodeRuleTunnels) — the stats route shares one lookup with its status gate. */
   nodeTunnels?: Set<number>,
-): Promise<void> {
+): Promise<number[]> {
   const serviceSamples = samples.filter((s) => !s.client);
   await rollupServiceMetrics(db, nodeId, serviceSamples);
-  if (serviceSamples.length === 0) return;
+  if (serviceSamples.length === 0) return [];
 
   // Service-level rows only; per-client rows are breakdowns of the same
   // traffic. Shared exit listeners (service-t{tunnelId}) do not parse as rule
@@ -285,6 +268,8 @@ export async function ingestTraffic(
       })
       .where(eq(relayNodes.id, nodeId));
   }
+
+  return [...buckets.keys()];
 }
 
 /**

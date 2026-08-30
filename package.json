@@ -7,8 +7,9 @@
     "packages/*"
   ],
   "scripts": {
-    "dev:agent": "cd apps/agent && go run .",
-    "test:agent": "cd apps/agent && go test ./...",
+    "dev:agent": "cd apps/agent && cargo run",
+    "test:agent": "cd apps/agent && cargo test",
+    "clippy:agent": "cd apps/agent && cargo clippy --all-targets",
     "dev:server": "wrangler dev",
     "dev:web": "bun run --filter @tyz/web dev",
     "build:web": "bun run --filter @tyz/web build",

@@ -1,15 +1,6 @@
-import type {
-  Chain,
-  ForwardMode,
-  NodeConfigData,
-  RelayNode,
-  RelayRule,
-  TlsConfig,
-  Tunnel,
-  TunnelPayload,
-} from "@tyz/shared";
-import { ChainType, ForwardMode as ForwardModeEnum, TLS_LINK_TRANSPORTS } from "@tyz/shared";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import type { Chain, RealmNodeConfig, RealmService, RealmTarget, RelayNode, RelayRule, Tunnel } from "@tyz/shared";
+import { ChainType, Transport } from "@tyz/shared";
+import { eq, inArray, sql } from "drizzle-orm";
 import { applyRuleQuotas } from "../services/quota";
 import { ensureTlsMaterial } from "../services/tls";
 import type { Database } from "./index";
@@ -50,15 +41,6 @@ export function toTunnel(row: TunnelRow): Tunnel {
     ...entity,
     description: opt(entity.description),
     ingress_display_address: opt(entity.ingress_display_address),
-  };
-}
-
-/** Agent payload shape: entity + relay link credentials. */
-export function toTunnelPayload(row: TunnelRow): TunnelPayload {
-  return {
-    ...row,
-    description: opt(row.description),
-    ingress_display_address: opt(row.ingress_display_address),
   };
 }
 
@@ -133,15 +115,6 @@ export async function getRulesForTunnels(db: Database, tunnelIds: number[]): Pro
   return rows.map(toRelayRule);
 }
 
-export async function getNodeTlsConfig(db: Database, nodeId: number): Promise<TlsConfig | undefined> {
-  const row = await db
-    .select({ tls_config: relayNodes.tls_config })
-    .from(relayNodes)
-    .where(eq(relayNodes.id, nodeId))
-    .get();
-  return opt(row?.tls_config);
-}
-
 // ---- node_configs snapshot ----
 
 export async function getNodeConfigSnapshot(
@@ -180,117 +153,218 @@ export async function deleteNodeConfigSnapshot(db: Database, nodeId: number): Pr
   await db.delete(nodeConfigs).where(eq(nodeConfigs.node_id, nodeId)).run();
 }
 
-// ---- Aggregation ----
+// ---- Realm config renderer (docs/agent-realm-rust-refactor.md §7.4) ----
 
-function randomHex(bytes: number): string {
-  const raw = crypto.getRandomValues(new Uint8Array(bytes));
-  return Array.from(raw, (b) => b.toString(16).padStart(2, "0")).join("");
+/**
+ * Deterministic raw-mode exit port: start + ((ruleId*31 + nodeId) % range).
+ * Same formula the legacy Go builder used on both ends; now computed once
+ * here and delivered as an explicit value. Collisions surface as
+ * apply_failed service health on the agent (warned below).
+ */
+function allocatePortForRule(nodePorts: string, ruleId: number, nodeId: number): number | null {
+  const match = /^(\d+)-(\d+)$/.exec(nodePorts);
+  if (!match) return null;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  if (!(start >= 1 && end <= 65535 && start <= end)) return null;
+  return start + ((ruleId * 31 + nodeId) % (end - start + 1));
 }
 
 /**
- * Relay link credentials for tunnels created before the columns existed (or
- * wiped): generate once and persist, so both link ends see the same values on
- * every subsequent aggregation.
+ * Split a rule target ("host:port", IPv6 bracketed) into host + port.
+ * Returns null for anything unparsable — the renderer skips such rules
+ * with a warning instead of shipping a broken service.
  */
-async function ensureTunnelRelayAuth(db: Database, rows: TunnelRow[]): Promise<void> {
-  for (const row of rows) {
-    if (row.relay_auth_user && row.relay_auth_pass) continue;
-    const user = `relay-${row.id}-${randomHex(4)}`;
-    const pass = randomHex(16);
-    // Parallel per-node recomputes may both see the NULL auth: the conditional
-    // update lets exactly one writer win, and the re-read adopts the winner's
-    // values so every node snapshot embeds the same credentials.
-    await db
-      .update(tunnels)
-      .set({ relay_auth_user: user, relay_auth_pass: pass })
-      .where(and(eq(tunnels.id, row.id), isNull(tunnels.relay_auth_user)));
-    const stored = await db
-      .select({ relay_auth_user: tunnels.relay_auth_user, relay_auth_pass: tunnels.relay_auth_pass })
-      .from(tunnels)
-      .where(eq(tunnels.id, row.id))
-      .get();
-    if (stored?.relay_auth_user && stored?.relay_auth_pass) {
-      row.relay_auth_user = stored.relay_auth_user;
-      row.relay_auth_pass = stored.relay_auth_pass;
-    }
-  }
+export function parseTargetAddress(addr: string): RealmTarget | null {
+  const idx = addr.lastIndexOf(":");
+  if (idx <= 0 || idx === addr.length - 1) return null;
+  const host = addr.slice(0, idx).replace(/^\[|\]$/g, "");
+  const port = Number(addr.slice(idx + 1));
+  if (host.length === 0 || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host, port };
+}
+
+const REALM_LISTEN_HOST = "0.0.0.0";
+const REALM_CONNECT_TIMEOUT_S = 5;
+
+/** Compose the (host, port) an entry dials for one exit node: the rule's
+ * explicit exit_port when pinned, else the deterministic allocation from
+ * THAT exit node's port range (both sides agree without coordination). */
+function exitTargetFor(rule: RelayRule, exitNode: RelayNode): RealmTarget | null {
+  const port = rule.exit_port > 0 ? rule.exit_port : allocatePortForRule(exitNode.ports, rule.id, exitNode.id);
+  if (!port) return null;
+  return { host: exitNode.address, port };
 }
 
 /**
- * Normalize a tunnel's mode flags against its actual chain shape. The admin
- * API rejects invalid combinations on write; this guard keeps a hand-edited or
- * racy DB state from reaching agents as a config the builder cannot render
- * consistently on both ends:
- * - raw is valid for the single-node shape (one `in` chain — direct forward,
- *   no exit port pairs) and the two-hop shape (one `in` + one `out`); anything
- *   else degrades to relay (which handles 1/2/3+ hops);
- * - tls_enabled requires the 2-hop shape with a TLS-capable out transport
- *   (TLS_LINK_TRANSPORTS), otherwise the link stays plaintext (consistent on
- *   both ends).
+ * Build the RealmNodeConfig for one node — the ONLY config flavor since the
+ * realm agent cutover (zero schema change: the flavor lives in
+ * node_configs.config_json). Semantics:
+ * - every tunnel renders with raw port-pair semantics (forward_mode is
+ *   retired; legacy relay rows render identically);
+ * - entry node (in link): one service-{ruleId} per rule, listen_port →
+ *   exit:exit_port, TLS legs marked tls_side=connect;
+ * - exit nodes (out links): one service-{ruleId} per rule on their own
+ *   exit_port → rule target, TLS legs marked tls_side=listen;
+ * - single-node tunnels (in link only): direct forward to the rule target;
+ * - several out links = exit candidate set: primary + extra_targets with a
+ *   balance strategy from the in link's strategy column (round→roundrobin);
+ *   TLS tunnels stay single-exit (admin validation rejects duplicates);
+ * - tunnels with chain (middle-hop) links are skipped — no hop chaining in
+ *   the realm data plane;
+ * - quota hard-stopped rules drop out via applyRuleQuotas (shared gate with
+ *   the legacy pipeline); rule.limit / quota never enter the payload.
  */
-export function normalizeTunnelMode(
-  row: TunnelRow,
-  tunnelChains: Chain[],
-): { forward_mode: ForwardMode; tls_enabled: boolean } {
-  const outs = tunnelChains.filter((c) => c.chain_type === ChainType.OUT);
-  const ins = tunnelChains.filter((c) => c.chain_type === ChainType.IN);
-  const twoHop = tunnelChains.length === 2 && ins.length === 1 && outs.length === 1;
-  const singleNode = tunnelChains.length === 1 && ins.length === 1;
-  const forward_mode: ForwardMode =
-    row.forward_mode === ForwardModeEnum.RAW && (twoHop || singleNode) ? ForwardModeEnum.RAW : ForwardModeEnum.RELAY;
-  const outTransport = outs[0]?.transport ?? null;
-  const tls_enabled =
-    row.tls_enabled &&
-    forward_mode === "relay" &&
-    twoHop &&
-    outTransport !== null &&
-    TLS_LINK_TRANSPORTS.has(outTransport);
-  return { forward_mode, tls_enabled };
-}
-
-/**
- * Build the NodeConfigData for one node:
- * node -> chains touching this node -> tunnels -> rules attached to those tunnels
- *         + every chain of those tunnels (the full relay path), ordered by index.
- * Rules owned by tenants are quota-filtered/enriched (see services/quota.ts):
- * hard-stopped rules drop out of the payload entirely.
- */
-export async function aggregateNodeConfig(db: Database, nodeId: number): Promise<NodeConfigData | null> {
+export async function buildRealmNodeConfig(db: Database, nodeId: number): Promise<RealmNodeConfig | null> {
   const node = await getNode(db, nodeId);
   if (!node) return null;
 
   const nodeChains = await getChainsForNode(db, nodeId);
   const tunnelIds = [...new Set(nodeChains.map((c) => c.tunnel_id))];
   const tunnelRows = await getTunnelsByIds(db, tunnelIds);
-  await ensureTunnelRelayAuth(db, tunnelRows);
   const rules = await applyRuleQuotas(db, await getRulesForTunnels(db, tunnelIds));
   const allChains = await getChainsForTunnels(db, tunnelIds);
-  // Node records for every node the chains reference, so agents can resolve
-  // dial addresses per hop (each chain row's node_id -> address + port range).
-  const chainNodes = await getNodesByIds(db, [...new Set(allChains.map((c) => c.node_id))]);
+  const nodeRecs = await getNodesByIds(db, [...new Set(allChains.map((c) => c.node_id))]);
+  const nodeById = new Map(nodeRecs.map((n) => [n.id, n]));
 
-  const chainsOf = (tunnelId: number) => allChains.filter((c) => c.tunnel_id === tunnelId);
-  const tunnelsOf: TunnelPayload[] = tunnelRows.map((row) => ({
-    ...toTunnelPayload(row),
-    ...normalizeTunnelMode(row, chainsOf(row.id)),
-  }));
+  const services: RealmService[] = [];
+  let tlsWanted = false;
 
-  let tlsMaterial: NodeConfigData["tls_material"];
-  if (tunnelsOf.some((t) => t.tls_enabled)) {
-    // Generates on first use (and after domain change); the snapshot content
-    // diff turns any PEM change into a config version bump + WS push.
-    tlsMaterial = await ensureTlsMaterial(db);
+  for (const tunnel of tunnelRows) {
+    const tChains = allChains.filter((c) => c.tunnel_id === tunnel.id);
+    if (tChains.some((c) => c.chain_type === ChainType.CHAIN)) {
+      console.warn(`[realm-config] tunnel ${tunnel.id}: middle-hop chains are unsupported, tunnel skipped`);
+      continue;
+    }
+    const ins = tChains.filter((c) => c.chain_type === ChainType.IN);
+    const outs = tChains.filter((c) => c.chain_type === ChainType.OUT).sort((a, b) => a.index - b.index || a.id - b.id);
+    if (ins.length !== 1) {
+      console.warn(`[realm-config] tunnel ${tunnel.id}: expected exactly one in link (got ${ins.length}), skipped`);
+      continue;
+    }
+    const isInNode = ins[0].node_id === nodeId;
+    const ownOuts = outs.filter((o) => o.node_id === nodeId);
+    if (isInNode && ownOuts.length > 0) {
+      console.warn(`[realm-config] tunnel ${tunnel.id}: node ${nodeId} holds both ends, unsupported, skipped`);
+      continue;
+    }
+    if (!isInNode && ownOuts.length === 0) continue; // chains reference the node only indirectly
+
+    // TLS link: only the tls transport, only a single exit. Legacy tunnels
+    // with other transports (or missing material) degrade to plaintext.
+    let tlsLink = false;
+    if (tunnel.tls_enabled && outs.length > 0) {
+      if (outs[0].transport !== Transport.TLS) {
+        console.warn(
+          `[realm-config] tunnel ${tunnel.id}: tls_enabled with transport '${outs[0].transport}' degrades to plaintext (realm speaks tls only)`,
+        );
+      } else {
+        if (outs.length > 1) {
+          console.warn(`[realm-config] tunnel ${tunnel.id}: TLS tunnels stay single-exit, using the first out link`);
+        }
+        tlsLink = true;
+      }
+    }
+
+    const tunnelRules = rules.filter((r) => r.tunnel_id === tunnel.id);
+
+    if (isInNode) {
+      const exits = tlsLink ? outs.slice(0, 1) : outs;
+      const balance = ins[0].strategy === "iphash" ? "iphash" : "roundrobin";
+      for (const rule of tunnelRules) {
+        const service: RealmService = {
+          name: `service-${rule.id}`,
+          listen_host: REALM_LISTEN_HOST,
+          listen_port: rule.listen_port,
+          target_host: "",
+          target_port: 0,
+          connect_timeout_s: REALM_CONNECT_TIMEOUT_S,
+        };
+        if (tlsLink) {
+          service.tls_side = "connect";
+          tlsWanted = true;
+        }
+        if (exits.length === 0) {
+          const target = parseTargetAddress(rule.targets);
+          if (!target) {
+            console.warn(`[realm-config] rule ${rule.id}: unparsable target '${rule.targets}', skipped`);
+            continue;
+          }
+          service.target_host = target.host;
+          service.target_port = target.port;
+        } else {
+          const primary = exitTargetFor(rule, nodeById.get(exits[0].node_id) ?? node);
+          if (!primary) {
+            console.warn(`[realm-config] rule ${rule.id}: exit port allocation failed, skipped`);
+            continue;
+          }
+          service.target_host = primary.host;
+          service.target_port = primary.port;
+          const extras: RealmTarget[] = [];
+          for (const out of exits.slice(1)) {
+            const extra = exitTargetFor(rule, nodeById.get(out.node_id) ?? node);
+            if (extra) extras.push(extra);
+          }
+          if (extras.length > 0) {
+            service.extra_targets = extras;
+            service.balance = balance;
+          }
+        }
+        services.push(service);
+      }
+    }
+
+    for (const rule of tunnelRules) {
+      const target = parseTargetAddress(rule.targets);
+      if (!target) {
+        console.warn(`[realm-config] rule ${rule.id}: unparsable target '${rule.targets}', skipped`);
+        continue;
+      }
+      const exitPort = rule.exit_port > 0 ? rule.exit_port : allocatePortForRule(node.ports, rule.id, node.id);
+      if (!exitPort) {
+        console.warn(`[realm-config] rule ${rule.id}: exit port allocation failed, skipped`);
+        continue;
+      }
+      const service: RealmService = {
+        name: `service-${rule.id}`,
+        listen_host: REALM_LISTEN_HOST,
+        listen_port: exitPort,
+        target_host: target.host,
+        target_port: target.port,
+        connect_timeout_s: REALM_CONNECT_TIMEOUT_S,
+      };
+      if (tlsLink) {
+        service.tls_side = "listen";
+        tlsWanted = true;
+      }
+      services.push(service);
+    }
   }
 
-  const config: NodeConfigData = {
-    node,
-    nodes: chainNodes,
-    rules,
-    tunnels: tunnelsOf,
-    chains: allChains,
-    tls: await getNodeTlsConfig(db, nodeId),
-    ...(tlsMaterial ? { tls_material: tlsMaterial } : {}),
-  };
+  // Stable order for deterministic snapshots (version-bump diffing) — sort by
+  // name then port; same-name services (entry+exit on different nodes never
+  // collide here since each node renders only its own).
+  services.sort((a, b) => a.name.localeCompare(b.name) || a.listen_port - b.listen_port);
+  const seen = new Set<string>();
+  for (const s of services) {
+    const key = `${s.listen_host}:${s.listen_port}`;
+    if (seen.has(key)) {
+      console.warn(`[realm-config] node ${nodeId}: port ${s.listen_port} shared by services (${s.name})`);
+    }
+    seen.add(key);
+  }
+
+  const config: RealmNodeConfig = { agent: "realm", node: { id: node.id, name: node.name }, services };
+  if (tlsWanted) {
+    try {
+      config.tls_material = await ensureTlsMaterial(db);
+    } catch (err) {
+      // No TLS domain configured (or generation failed): degrade BOTH legs to
+      // plaintext — the exit renders the same way from the same flags.
+      console.warn(`[realm-config] node ${nodeId}: TLS material unavailable, degrading links to plaintext`, err);
+      for (const s of services) delete s.tls_side;
+    }
+  }
   return config;
 }
 
@@ -307,7 +381,7 @@ export interface RecomputeResult {
  * force every agent into a pointless full refetch.
  */
 export async function recomputeNodeConfig(db: Database, nodeId: number): Promise<RecomputeResult> {
-  const config = await aggregateNodeConfig(db, nodeId);
+  const config = await buildRealmNodeConfig(db, nodeId);
   const now = new Date().toISOString();
   if (!config) {
     await deleteNodeConfigSnapshot(db, nodeId);
@@ -321,3 +395,6 @@ export async function recomputeNodeConfig(db: Database, nodeId: number): Promise
   await upsertNodeConfigSnapshot(db, nodeId, configJson, now);
   return { ok: true, changed: true };
 }
+
+// (end of renderer — the legacy NodeConfigData aggregation was removed with
+// the Go agent cutover; see git history for the gost-era pipeline)

@@ -1,7 +1,7 @@
-import type { NodeConfigData } from "./entities";
+import type { RealmNodeConfig } from "./entities";
 
 /** Response of GET /agent/config when a newer config version exists. */
 export interface AgentConfigResponse {
   version: number;
-  config: NodeConfigData;
+  config: RealmNodeConfig;
 }

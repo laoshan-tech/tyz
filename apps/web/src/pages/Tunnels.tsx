@@ -7,7 +7,6 @@ import {
   ChainType,
   type CreateChainInput,
   type CreateTunnelInput,
-  ForwardMode,
   type NodeWithMeta,
   Transport,
   type Tunnel,
@@ -16,12 +15,11 @@ import {
 import { type FormEvent, useMemo, useState } from "react";
 import { api } from "../api";
 import { confirmDanger } from "../confirm";
-import { chainTypeLabel, FORWARD_MODE_HINTS, forwardModeLabel } from "../labels";
+import { chainTypeLabel } from "../labels";
 import { nodesListOptions, tunnelsListOptions } from "../queries";
 import {
   DataText,
   emptyState,
-  FilterSelect,
   type FormErrors,
   FormFooter,
   FormModal,
@@ -47,16 +45,13 @@ import {
 
 // ---- Tunnel form ----
 
-const FORWARD_MODE_OPTIONS = [
-  { value: ForwardMode.RELAY, label: "端口复用（relay 协议，默认）" },
-  { value: ForwardMode.RAW, label: "直通转发（原生 TCP，每规则独立端口）" },
-];
+// forward_mode is retired — every tunnel renders with raw port-pair semantics
+// on the realm agent (no relay protocol, one port pair per rule on both ends).
 
 interface TunnelFormValues {
   name: string;
   ingress_display_address: string;
   description: string;
-  forward_mode: string;
   tls_enabled: boolean;
 }
 
@@ -106,29 +101,20 @@ function TunnelForm({
     name: tunnel?.name ?? "",
     ingress_display_address: tunnel?.ingress_display_address ?? "",
     description: tunnel?.description ?? "",
-    forward_mode: (tunnel?.forward_mode ?? ForwardMode.RELAY) as string,
     tls_enabled: tunnel?.tls_enabled ?? false,
   }));
   const [errors, setErrors] = useState<FormErrors<TunnelFormValues>>({});
-  // A single-hop tunnel (one `in` chain, no exit node) renders identically
-  // for both modes (direct tcp forwarding); the stored value is kept as the
-  // operator picks it. TLS needs the 2-hop shape, so it stays hidden.
-  const singleHop = (tunnel?.chain_count ?? 0) === 1;
 
   const onSubmitForm = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const errs: FormErrors<TunnelFormValues> = {};
     if (!values.name.trim()) errs.name = "请输入名称";
-    if (values.forward_mode === ForwardMode.RAW && values.tls_enabled) {
-      errs.tls_enabled = "直通转发不支持 TLS（链路即纯 TCP）";
-    }
     setErrors(errs);
     if (hasErrors(errs)) return;
     onSubmit({
       name: values.name,
       ingress_display_address: values.ingress_display_address || undefined,
       description: values.description || undefined,
-      forward_mode: values.forward_mode as ForwardMode,
       tls_enabled: values.tls_enabled,
     });
   };
@@ -142,42 +128,26 @@ function TunnelForm({
         value={values.ingress_display_address}
         onChange={(v) => set("ingress_display_address", v)}
       />
-      <SelectForm
-        label="转发模式"
-        options={FORWARD_MODE_OPTIONS}
-        value={values.forward_mode}
-        onChange={(v) => set("forward_mode", String(v))}
-        hint={
-          singleHop ? "单节点隧道两种模式生成的配置相同（直连转发）；添加出口链路后模式才会产生实际区别" : undefined
-        }
-      />
-      {singleHop ? null : values.forward_mode === ForwardMode.RAW ? (
-        <p className="text-muted">
-          直通转发：不走 relay 协议、无端口复用——每条规则在两端各占一个独立 TCP 端口，链路上无任何自定义协议特征。
-        </p>
-      ) : (
-        <div className="flex flex-col gap-1">
-          <Switch
-            isSelected={values.tls_enabled}
-            onChange={(v) => set("tls_enabled", v)}
-            isInvalid={!!errors.tls_enabled}
-          >
-            <Switch.Content>
-              <Switch.Control>
-                <Switch.Thumb />
-              </Switch.Control>
-              TLS 加密链路（平台证书，双向验证）
-            </Switch.Content>
-            {errors.tls_enabled ? <FieldError>{errors.tls_enabled}</FieldError> : null}
-          </Switch>
-          {values.tls_enabled ? (
-            <p className="text-muted">
-              出口链路的传输需为 grpc/tls/wss/mwss/mtls（grpc 走 TLS1.3 + h2，外观为普通 gRPC 流量；wss/mwss 走 TLS1.3 +
-              h2/http1.1，外观为 Go WebSocket 客户端）。启用前请先在设置中配置 TLS 伪装域名。
-            </p>
-          ) : null}
-        </div>
-      )}
+      <div className="flex flex-col gap-1">
+        <Switch
+          isSelected={values.tls_enabled}
+          onChange={(v) => set("tls_enabled", v)}
+          isInvalid={!!errors.tls_enabled}
+        >
+          <Switch.Content>
+            <Switch.Control>
+              <Switch.Thumb />
+            </Switch.Control>
+            TLS 加密链路（平台证书）
+          </Switch.Content>
+          {errors.tls_enabled ? <FieldError>{errors.tls_enabled}</FieldError> : null}
+        </Switch>
+        {values.tls_enabled ? (
+          <p className="text-muted">
+            入口与出口之间的链路以 TLS 1.3 加密（出口链路的传输需为 tls）。启用前请先在设置中配置 TLS 伪装域名。
+          </p>
+        ) : null}
+      </div>
       <TextForm
         label="描述"
         multiline
@@ -194,10 +164,18 @@ function TunnelForm({
 
 const CHAIN_TYPE_OPTIONS = [
   { value: ChainType.IN, label: "入口 (in)" },
-  { value: ChainType.CHAIN, label: "中继 (chain)" },
   { value: ChainType.OUT, label: "出口 (out)" },
 ];
-const TRANSPORT_OPTIONS = Object.values(Transport).map((v) => ({ value: v, label: v }));
+// The realm data plane speaks kaminari TLS only; raw stays plaintext. Several
+// out links form the tunnel's exit candidate set (load-balanced per rule).
+const TRANSPORT_OPTIONS = [
+  { value: Transport.RAW, label: "raw（明文 TCP）" },
+  { value: Transport.TLS, label: "tls（TLS 1.3）" },
+];
+const STRATEGY_OPTIONS = [
+  { value: "round", label: "round（轮询）" },
+  { value: "iphash", label: "iphash（按客户端 IP 粘滞）" },
+];
 
 interface ChainFormValues {
   node_id: string | null;
@@ -220,7 +198,7 @@ function chainFormValues(chain: Chain | null): ChainFormValues {
       }
     : {
         node_id: null,
-        chain_type: ChainType.CHAIN,
+        chain_type: ChainType.IN,
         transport: Transport.RAW,
         index: 0,
         port: 0,
@@ -288,12 +266,12 @@ function ChainForm({
     if (hasErrors(errs)) return;
     onSubmit({
       node_id: Number(values.node_id),
-      chain_type: values.chain_type as ChainType,
-      transport: values.transport as Transport,
+      chain_type: values.chain_type as ChainType.IN | ChainType.OUT,
+      transport: values.transport as Transport.RAW | Transport.TLS,
       index: values.index,
       // 入口行的监听端口由转发规则指定，链路端口不适用（服务端同样强制 0）。
       port: values.chain_type === ChainType.IN ? 0 : values.port,
-      strategy: values.strategy,
+      strategy: values.strategy as "round" | "iphash",
     });
   };
 
@@ -331,7 +309,13 @@ function ChainForm({
           onChange={(v) => set("port", v ?? 0)}
         />
       </div>
-      <TextForm label="策略" placeholder="round" value={values.strategy} onChange={(v) => set("strategy", v)} />
+      <SelectForm
+        label="策略（多出口分流）"
+        options={STRATEGY_OPTIONS}
+        value={values.strategy}
+        onChange={(v) => set("strategy", String(v))}
+        hint="隧道有多条出口链路时生效：按连接选择出口"
+      />
       <FormFooter onCancel={onCancel} isPending={submitting} />
     </FormShell>
   );
@@ -466,14 +450,8 @@ function ChainsDrawer({ tunnel, nodes, onClose }: { tunnel: Tunnel; nodes: NodeW
 }
 
 // ---- Page ----
-
-type TunnelModeFilter = "all" | ForwardMode;
-
-const TUNNEL_MODE_FILTERS: { value: TunnelModeFilter; label: string }[] = [
-  { value: "all", label: "全部" },
-  { value: ForwardMode.RELAY, label: forwardModeLabel(ForwardMode.RELAY).label },
-  { value: ForwardMode.RAW, label: forwardModeLabel(ForwardMode.RAW).label },
-];
+// The forward-mode filter/chip is retired with forward_mode itself — every
+// tunnel renders raw port pairs; the list shows chain count + TLS instead.
 
 export default function TunnelsPage() {
   const queryClient = useQueryClient();
@@ -482,7 +460,6 @@ export default function TunnelsPage() {
   const [creating, setCreating] = useState(createParam === "1");
   const [chainsOf, setChainsOf] = useState<TunnelWithMeta | null>(null);
   const [search, setSearch] = useState("");
-  const [modeFilter, setModeFilter] = useState<TunnelModeFilter>("all");
 
   const tunnelsQuery = useQuery(tunnelsListOptions);
   const nodesQuery = useQuery(nodesListOptions);
@@ -494,14 +471,13 @@ export default function TunnelsPage() {
   const tunnels = useMemo(() => {
     const q = search.trim().toLowerCase();
     const all = tunnelsQuery.data?.tunnels ?? [];
-    return all.filter((t) => {
-      if (modeFilter !== "all" && t.forward_mode !== modeFilter) return false;
-      if (!q) return true;
-      return [String(t.id), t.name, t.description ?? "", t.ingress_display_address ?? ""].some((field) =>
+    if (!q) return all;
+    return all.filter((t) =>
+      [String(t.id), t.name, t.description ?? "", t.ingress_display_address ?? ""].some((field) =>
         field.toLowerCase().includes(q),
-      );
-    });
-  }, [tunnelsQuery.data, search, modeFilter]);
+      ),
+    );
+  }, [tunnelsQuery.data, search]);
 
   return (
     <PageShell>
@@ -515,13 +491,11 @@ export default function TunnelsPage() {
         }
       >
         <SearchInput value={search} onChange={setSearch} placeholder="搜索隧道" />
-        <FilterSelect label="转发模式筛选" options={TUNNEL_MODE_FILTERS} value={modeFilter} onChange={setModeFilter} />
         <ToolbarButton
           icon={<IconEraser size={16} stroke={2} />}
-          isDisabled={search === "" && modeFilter === "all"}
+          isDisabled={search === ""}
           onPress={() => {
             setSearch("");
-            setModeFilter("all");
           }}
         >
           重置
@@ -558,9 +532,7 @@ export default function TunnelsPage() {
               </Table.Header>
               <Table.Body
                 items={tunnels}
-                renderEmptyState={emptyState(
-                  search || modeFilter !== "all" ? "没有匹配的结果" : "暂无数据，点击「新建隧道」开始",
-                )}
+                renderEmptyState={emptyState(search ? "没有匹配的结果" : "暂无数据，点击「新建隧道」开始")}
               >
                 {(t) => (
                   <Table.Row id={t.id}>
@@ -572,14 +544,11 @@ export default function TunnelsPage() {
                     </Table.Cell>
                     <Table.Cell>
                       <div className="flex items-center gap-1">
-                        <StatusChip
-                          tone={forwardModeLabel(t.forward_mode).tone}
-                          title={FORWARD_MODE_HINTS[t.forward_mode] ?? t.forward_mode}
-                        >
-                          {forwardModeLabel(t.forward_mode).label}
+                        <StatusChip tone="default" title={`链路数（入口 + 出口）`}>
+                          {t.chain_count} 链路
                         </StatusChip>
                         {t.tls_enabled ? (
-                          <StatusChip tone="success" title="链路 TLS（mTLS + 平台证书）">
+                          <StatusChip tone="success" title="链路 TLS（平台证书）">
                             TLS
                           </StatusChip>
                         ) : null}

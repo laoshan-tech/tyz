@@ -20,18 +20,11 @@ export enum Transport {
 }
 
 /**
- * Transports that can carry a TLS-encrypted relay link (tunnels.tls_enabled,
- * 2-hop relay shape only). The builder maps each to a TLS-terminating GOST
- * listener/dialer type and pins the offered-ALPN profile; ws/mws without TLS
- * stay plaintext by design.
+ * Transports that can carry a TLS-encrypted link (tunnels.tls_enabled, 2-hop
+ * shape). The realm agent speaks kaminari TLS only, so this is exactly {tls};
+ * kept as a set so call sites stay unchanged.
  */
-export const TLS_LINK_TRANSPORTS: ReadonlySet<Transport> = new Set([
-  Transport.GRPC,
-  Transport.TLS,
-  Transport.WSS,
-  Transport.MWSS,
-  Transport.MTLS,
-]);
+export const TLS_LINK_TRANSPORTS: ReadonlySet<Transport> = new Set([Transport.TLS]);
 
 export enum RelayRuleStatus {
   CREATED = "created",
@@ -46,10 +39,10 @@ export enum UserStatus {
 }
 
 /**
- * Two-node tunnel forward mode. 'relay' (default): port-multiplexed relay
- * protocol, one exit listener shared by every rule of the tunnel. 'raw':
- * plain tcp/tcp forwarding with a dedicated port per rule on BOTH nodes —
- * no relay protocol header on the wire (censorship-evasion mode).
+ * Two-node tunnel forward mode. LEGACY column: the realm agent renders every
+ * tunnel with raw (port-pair) semantics regardless of the stored value; admin
+ * writes no longer accept 'relay' and always store 'raw'. Kept for schema
+ * stability — see docs/agent-realm-rust-refactor.md §7.3.
  */
 export enum ForwardMode {
   RELAY = "relay",
@@ -294,5 +287,44 @@ export interface NodeConfigData {
   chains: Chain[];
   tls?: TlsConfig;
   /** Present only when at least one of the node's tunnels enables link TLS. */
+  tls_material?: TlsMaterial;
+}
+
+// ---- Realm agent payload (docs/agent-realm-rust-refactor.md §8) ----
+
+/** One forwarding destination of a realm service (LB candidates included). */
+export interface RealmTarget {
+  host: string; // IP or domain (resolved per connection on the agent)
+  port: number;
+}
+
+/**
+ * One managed realm forward: `listen_port → target` (+ optional extra targets
+ * load-balanced per connection). `tls_side` marks which end of an encrypted
+ * link this service is: "listen" = TLS server (exit leg), "connect" = TLS
+ * client dialing the exit (entry leg).
+ */
+export interface RealmService {
+  name: string; // service-{ruleId} — billing/status/restart all key off this
+  listen_host: string;
+  listen_port: number;
+  target_host: string;
+  target_port: number;
+  /** Additional exit candidates (LB); only when the tunnel has several out links. */
+  extra_targets?: RealmTarget[];
+  /** Selection strategy over [target, extra_targets]; default roundrobin. */
+  balance?: "roundrobin" | "iphash";
+  tls_side?: "listen" | "connect";
+  /** Offered ALPN on the TLS client leg (kaminari option); unset = none. */
+  alpn?: string[];
+  connect_timeout_s?: number; // default 5 (realm's network.tcp_timeout)
+}
+
+/** Config payload consumed by the Rust realm agent (GET /api/agent/config). */
+export interface RealmNodeConfig {
+  agent: "realm";
+  node: { id: number; name: string };
+  services: RealmService[];
+  /** Present iff any service carries tls_side (same set for both legs). */
   tls_material?: TlsMaterial;
 }

@@ -4,7 +4,7 @@
 
 - **控制面**（`apps/server`，Cloudflare Worker + D1 + Durable Object）：通过 **Workers Builds** 接入 Git 仓库——一次性配置后，**日常发布 = `git push`**；
 - **管理面板**（`apps/web`）：随控制面一起部署（构建产物由 Worker Assets 托管，无需单独部署）;
-- **节点机 agent**（`apps/agent`，Go 单二进制、内嵌 GOST 运行时）：每台中继机器一个容器（host 网络）。
+- **节点机 agent**（`apps/agent`，Rust 单二进制、realm 生态数据面）：每台中继机器一个容器（host 网络）。
 
 仓库对公共部署友好：`wrangler.jsonc` **不携带任何账户相关的资源 ID**（D1 由 wrangler 自动资源供给创建并按名称保持绑定），**零 secrets 即可运行**——管理员账号在首次打开面板时经 `/setup` 向导创建（存于数据库），本地无需安装任何工具。
 
@@ -34,7 +34,7 @@
                 │ (config_changed → 304 / 200)  │
 ┌───────────────┴───────────────────────────────┴────────────────┐
 │  节点机 ×N（单容器，host 网络）                                     │
-│  tyz-agent（Go，内嵌 GOST 运行时）                                │
+│  tyz-agent（Rust，realm 数据面）                                  │
 │   ├─ 配置按对象 diff 热更新（进程内 registry）                      │
 │   └─ observer 统计 ──► 缓冲 ──► 批量上报                          │
 └─────────────────────────────────────────────────────────────────┘
@@ -185,7 +185,7 @@ curl https://tyz.example.com/api/healthz        # → {"ok":true}
 
 ### 3.8 与仓库自带 GitHub Actions 的关系
 
-- 控制面部署**不走 GitHub Actions**：仓库里的 Actions 只有 `check.yml`（lint + 类型检查 + agent Go 测试 + 前端构建）和 `docker-build.yml`（agent 镜像构建发布），均与部署无关，fork 后可原样保留。
+- 控制面部署**不走 GitHub Actions**：仓库里的 Actions 只有 `check.yml`（lint + 类型检查 + agent clippy/测试 + 前端构建）、`docker-build.yml`（agent 镜像构建发布）和 `agent-release.yml`（agent 二进制发布），均与部署无关，fork 后可原样保留。
 
 ### 3.9 日常发布
 
@@ -195,7 +195,7 @@ curl https://tyz.example.com/api/healthz        # → {"ok":true}
 git push origin master
 ```
 
-发布前本地（或依赖 `check.yml`）确认：`bun run lint && bun run type-check && go vet ./... && go test ./...`（agent 目录）。
+发布前本地（或依赖 `check.yml`）确认：`bun run lint && bun run type-check && cargo clippy --manifest-path apps/agent/Cargo.toml --all-targets && cargo test --manifest-path apps/agent/Cargo.toml`。
 
 ---
 
@@ -321,14 +321,15 @@ docker compose up -d
 
 ### 5.3 方式 B：裸机二进制 + systemd（备选）
 
-构建与安装（在任何有 Go ≥ 1.26 的机器上交叉编译，或直接在节点机本地构建）：
+构建与安装（在 release 页下载对应架构的 `tyz-agent-<tag>-linux-{amd64,arm64}.tar.gz` 并校验 SHA-256，或在任何装了 rustup 的机器上本地构建）：
 
 ```bash
 cd apps/agent
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o tyz-agent .
-# arm64 机器改 GOARCH=arm64
+TYZ_VERSION=dev cargo build --release --locked
+# 产物：target/release/tyz-agent（x86_64；arm64 加 --target aarch64-unknown-linux-gnu
+# 并设置 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc）
 
-scp tyz-agent root@<节点机>:/usr/local/bin/
+scp target/release/tyz-agent root@<节点机>:/usr/local/bin/
 ```
 
 节点机上：

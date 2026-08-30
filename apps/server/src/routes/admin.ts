@@ -65,6 +65,7 @@ import { listAudit, recordAudit } from "../services/audit";
 import { dashboardSummary, dashboardTraffic } from "../services/dashboard";
 import { broadcastNodeMessage, notifyConfigChanged } from "../services/notify";
 import { getActiveSubscriptions, quotaDecisionsForUsers, userQuotaSummary } from "../services/quota";
+import { recomputeAndNotify, recomputeTunnelNodes, recomputeUserNodes } from "../services/recompute";
 import { getTlsDomain, getTlsStatus, setTlsDomain, setTlsProfile } from "../services/tls";
 import { hashPassword } from "../utils/crypto";
 
@@ -136,40 +137,6 @@ function generateNodeToken(): string {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Recompute one node's snapshot and push a change notification to its agent. */
-async function recomputeAndNotify(env: Bindings, nodeId: number): Promise<boolean> {
-  const res = await recomputeNodeConfig(createDb(env.DB), nodeId);
-  if (res.changed) {
-    await notifyConfigChanged(env, [nodeId]);
-  }
-  return res.ok;
-}
-
-/**
- * Recompute config snapshots for every node that has a chain in the tunnel, then notify them.
- * Node aggregations are independent, so they run in PARALLEL — wall time stays
- * ~one node's recompute regardless of fleet size (each aggregation is 10-15
- * sequential D1 roundtrips; a serial loop made admin writes scale with O(nodes)).
- * A single node's failure is logged and skipped, never failing the admin write:
- * the daily cron's full recompute self-heals it.
- */
-async function recomputeTunnelNodes(env: Bindings, tunnelId: number): Promise<void> {
-  const db = createDb(env.DB);
-  const rows = await db.selectDistinct({ node_id: chains.node_id }).from(chains).where(eq(chains.tunnel_id, tunnelId));
-  const results = await Promise.allSettled(rows.map(({ node_id }) => recomputeNodeConfig(db, node_id)));
-  const changed: number[] = [];
-  results.forEach((result, i) => {
-    if (result.status === "fulfilled") {
-      if (result.value.changed) changed.push(rows[i].node_id);
-    } else {
-      console.error(`recompute node ${rows[i].node_id} (tunnel ${tunnelId}) failed`, result.reason);
-    }
-  });
-  if (changed.length > 0) {
-    await notifyConfigChanged(env, changed);
-  }
-}
-
 /**
  * Schedule the post-write recompute+push AFTER the response is sent: an admin
  * write's latency is its row write + audit, and agent convergence is async
@@ -181,18 +148,6 @@ async function recomputeTunnelNodes(env: Bindings, tunnelId: number): Promise<vo
  */
 function deferRecompute(c: Context<{ Bindings: Bindings; Variables: Variables }>, work: () => Promise<unknown>): void {
   c.executionCtx.waitUntil(work().catch((err) => console.error("deferred recompute failed", err)));
-}
-
-/** Recompute every node serving one user's rules (ownership/quota changes). */
-async function recomputeUserNodes(env: Bindings, userId: number): Promise<void> {
-  const db = createDb(env.DB);
-  const rows = await db
-    .selectDistinct({ tunnel_id: relayRules.tunnel_id })
-    .from(relayRules)
-    .where(eq(relayRules.user_id, userId));
-  await Promise.all(
-    rows.map(({ tunnel_id }) => (tunnel_id !== null ? recomputeTunnelNodes(env, tunnel_id) : undefined)),
-  );
 }
 
 // ---- Forward-mode / TLS shape validation ----
@@ -217,51 +172,39 @@ async function tunnelShape(db: Database, tunnelId: number): Promise<TunnelShape>
 
 /**
  * TLS shape rules: reject only states that can never be completed into the
- * valid 1-in / 1-out shape with a TLS-capable out transport (see
- * TLS_LINK_TRANSPORTS). A missing side (in-only or out-only) is
+ * valid 1-in / 1-out shape with the tls out transport (kaminari speaks TLS
+ * only — see TLS_LINK_TRANSPORTS). A missing side (in-only or out-only) is
  * a construction intermediate — links are added one modal at a time, so the
  * strict "exactly two nodes" check would deadlock the very first chain write.
- * Aggregation degrades intermediates to plaintext until the second link lands.
+ * The renderer degrades intermediates to plaintext until the second link lands.
  */
 function tlsShapeProblem(shape: TunnelShape): string | null {
   if (shape.ins > 1) return "TLS 隧道只允许一条入口链路";
   if (shape.outs > 1) return "TLS 隧道只允许一条出口链路";
   if (shape.outs === 1 && (shape.outTransport === null || !TLS_LINK_TRANSPORTS.has(shape.outTransport))) {
-    return "TLS 要求出口链路的传输为 grpc/tls/wss/mwss/mtls";
+    return "TLS 要求出口链路的传输为 tls";
   }
   return null;
 }
 
 /**
- * Validate the tunnel's mode flags against its chain shape. Empty tunnels
- * (no chains yet) accept anything — the shape is judged once links exist,
- * both on tunnel updates and on chain writes. Aggregation additionally
- * normalizes impossible states as a last line of defense.
+ * Validate a TLS enablement against the tunnel's chain shape (forward_mode is
+ * retired — every tunnel renders with raw port-pair semantics). Empty tunnels
+ * (no chains yet) accept anything; the shape is judged once links exist, both
+ * on tunnel updates and on chain writes.
  */
 async function validateTunnelMode(
   db: Database,
   tunnelId: number,
-  next: { forward_mode?: ForwardMode; tls_enabled?: boolean },
+  next: { tls_enabled?: boolean },
 ): Promise<string | null> {
   const row = await db.select().from(tunnels).where(eq(tunnels.id, tunnelId)).get();
   if (!row) return `tunnel ${tunnelId} not found`;
-  const forwardMode = next.forward_mode ?? row.forward_mode;
   const tlsEnabled = next.tls_enabled ?? row.tls_enabled;
-  if (forwardMode !== ForwardMode.RAW && !tlsEnabled) return null;
+  if (!tlsEnabled) return null;
 
   const shape = await tunnelShape(db, tunnelId);
   if (shape.total === 0) return null;
-
-  const twoHop = shape.total === 2 && shape.ins === 1 && shape.outs === 1;
-  const singleNode = shape.total === 1 && shape.ins === 1;
-  if (forwardMode === ForwardMode.RAW) {
-    if (tlsEnabled) return "raw 模式不支持 TLS（裸转发即纯 TCP）";
-    if (!singleNode && !twoHop) {
-      return "raw 模式仅支持单节点（仅入口链路）或两节点（一入口一出口）形态";
-    }
-    return null;
-  }
-  // tls_enabled relay tunnel: only unreachable states are rejected (see tlsShapeProblem)
   const problem = tlsShapeProblem(shape);
   if (problem) return problem;
   if (!(await getTlsDomain(db))) return "请先在设置中配置 TLS 伪装域名";
@@ -540,7 +483,10 @@ adminRoutes.post("/tunnels", async (c) => {
       name: input.name,
       description: input.description ?? null,
       ingress_display_address: input.ingress_display_address ?? null,
-      forward_mode: input.forward_mode,
+      // forward_mode is retired; every tunnel stores raw. The relay-auth
+      // columns are dormant (no protocol auth in the realm data plane) but
+      // stay populated for schema stability.
+      forward_mode: ForwardMode.RAW,
       tls_enabled: input.tls_enabled,
       relay_auth_user: `relay-${generateNodeToken().slice(0, 8)}`,
       relay_auth_pass: generateNodeToken(),
@@ -558,9 +504,8 @@ adminRoutes.put("/tunnels/:id", async (c) => {
     return c.json({ error: "invalid tunnel payload", detail: parsed.error.flatten() }, 400);
   }
   const input = parsed.data;
-  if (input.forward_mode !== undefined || input.tls_enabled !== undefined) {
+  if (input.tls_enabled !== undefined) {
     const problem = await validateTunnelMode(createDb(c.env.DB), id, {
-      forward_mode: input.forward_mode,
       tls_enabled: input.tls_enabled,
     });
     if (problem) return c.json({ error: problem }, 400);
@@ -569,7 +514,6 @@ adminRoutes.put("/tunnels/:id", async (c) => {
   if (input.name !== undefined) patch.name = input.name;
   if (input.description !== undefined) patch.description = input.description;
   if (input.ingress_display_address !== undefined) patch.ingress_display_address = input.ingress_display_address;
-  if (input.forward_mode !== undefined) patch.forward_mode = input.forward_mode;
   if (input.tls_enabled !== undefined) patch.tls_enabled = input.tls_enabled;
 
   if (Object.keys(patch).length === 0) {
@@ -747,23 +691,17 @@ adminRoutes.delete("/chains/:id", async (c) => {
   return c.json({ ok: true });
 });
 
-/** Shape rules shared by chain create/update against the tunnel's mode flags. */
+/** Shape rules shared by chain create/update against the tunnel's mode flags.
+ * Raw semantics (the only semantics now): at most one in link, any number of
+ * out links (multiple outs form the tunnel's LB exit set), no middle hops
+ * (the schema rejects chain-type rows). TLS tunnels additionally require the
+ * 1-in/1-out shape with the tls out transport. */
 async function validateProjectedShape(db: Database, tunnelId: number, shape: TunnelShape): Promise<string | null> {
   const row = await db.select().from(tunnels).where(eq(tunnels.id, tunnelId)).get();
   if (!row) return `tunnel ${tunnelId} not found`;
-  if (row.forward_mode !== ForwardMode.RAW && !row.tls_enabled) return null;
-  if (shape.total === 0) return null;
-  const twoHop = shape.total === 2 && shape.ins === 1 && shape.outs === 1;
-  const singleNode = shape.total === 1 && shape.ins === 1;
-  if (row.forward_mode === ForwardMode.RAW) {
-    if (!singleNode && !twoHop) {
-      return "raw 模式仅支持单节点（仅入口链路）或两节点（一入口一出口）形态";
-    }
-    return null;
-  }
-  // tls_enabled relay tunnel: only unreachable states are rejected; a missing
-  // side is a construction intermediate (links are created one at a time).
-  return tlsShapeProblem(shape);
+  if (shape.ins > 1) return "隧道只允许一条入口链路";
+  if (row.tls_enabled && shape.total > 0) return tlsShapeProblem(shape);
+  return null;
 }
 
 // ---- Relay rules ----

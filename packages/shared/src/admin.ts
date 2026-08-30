@@ -103,7 +103,8 @@ export const createTunnelSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
   ingress_display_address: z.string().optional(),
-  forward_mode: forwardModeSchema.default(ForwardMode.RELAY),
+  // forward_mode is retired (realm agent renders raw semantics for every
+  // tunnel); the server always stores 'raw'. The field is no longer accepted.
   tls_enabled: z.boolean().default(false),
 });
 export const updateTunnelSchema = createTunnelSchema.partial();
@@ -125,10 +126,13 @@ export interface TunnelWithMeta extends Tunnel {
 export const createChainSchema = z.object({
   tunnel_id: z.number().int().positive(),
   node_id: z.number().int().positive(),
-  chain_type: chainTypeSchema,
-  transport: transportSchema,
+  // The realm data plane has no hop chaining: only in (entry) and out (exit)
+  // links exist; several out links form the tunnel's exit candidate set (LB).
+  chain_type: chainTypeSchema.refine((v) => v !== "chain", "中链（多跳）已不支持"),
+  // kaminari speaks TLS only; raw stays plaintext.
+  transport: transportSchema.refine((v) => v === "raw" || v === "tls", "仅支持 raw / tls 传输"),
   index: z.number().int().nonnegative(),
-  strategy: z.string().default("round"),
+  strategy: z.enum(["round", "iphash"]).default("round"),
   port: z.number().int().nonnegative().default(0),
 });
 export const updateChainSchema = createChainSchema.partial();

@@ -4,8 +4,7 @@ import { generateTlsMaterial, type TlsProfile } from "../src/services/tls";
 /**
  * Structural self-checks for the hand-rolled DER encoder: the certificates it
  * produces must parse as DER and their ECDSA signatures must verify with
- * WebCrypto (the deeper x509 semantics — chain building, SAN, EKU — are
- * verified by the Go-side fixture test against crypto/x509).
+ * WebCrypto.
  */
 
 const PROFILE: TlsProfile = {

@@ -6,8 +6,14 @@ on:
       - master
   pull_request:
 
+# A new push to the same branch/PR supersedes the previous run.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
+  ts:
+    name: Server & Web
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -19,22 +25,39 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-
       - name: Lint
         run: bun run lint
 
       - name: Type check
         run: bun run type-check
 
-      - name: Vet and test agent
-        working-directory: apps/agent
-        run: |
-          go vet ./...
-          go test ./...
+      - name: Unit tests
+        working-directory: apps/server
+        run: bun test test/
 
       - name: Build web
         run: bun run build:web
+
+  rust:
+    name: Agent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Dep + target cache (keyed on Cargo.lock + toolchain). The pinned
+      # nightly from rust-toolchain.toml is auto-installed by rustup on the
+      # first cargo call — inside the crate dir, via working-directory:
+      # --manifest-path would bypass the CWD override and resolve stable.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/agent
+
+      - name: Clippy
+        working-directory: apps/agent
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        working-directory: apps/agent
+        run: cargo test
