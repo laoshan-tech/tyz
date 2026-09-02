@@ -1,11 +1,7 @@
 services:
-  app:
+  tyz:
     image: ghcr.io/laoshan-tech/tyz-node:latest
-    container_name: tyz-app
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ./.env:/var/lib/tyz/.env:ro
-      # Persist the auto-generated default certificate ($HOME/.gost) and the
-      # last-applied config cache (offline bootstrap) across restarts.
       - ./data:/var/lib/tyz
