@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::model::{GostStatsSample, ServiceHealthSample};
+use crate::model::{StatsSample, ServiceHealthSample};
 
 #[derive(Debug, Default)]
 pub struct Counters {
@@ -93,11 +93,11 @@ impl StatsRegistry {
     }
 
     /// One cumulative sample per key. Cheap: reads atomics under a short lock.
-    pub fn snapshot(&self) -> Vec<GostStatsSample> {
+    pub fn snapshot(&self) -> Vec<StatsSample> {
         let map = self.entries.lock().unwrap();
-        let mut samples: Vec<GostStatsSample> = map
+        let mut samples: Vec<StatsSample> = map
             .iter()
-            .map(|((service, client), c)| GostStatsSample {
+            .map(|((service, client), c)| StatsSample {
                 service: service.clone(),
                 client: client.clone(),
                 total_conns: c.total_conns.load(Ordering::Relaxed),
@@ -123,7 +123,7 @@ impl StatsRegistry {
 #[derive(Debug, Default)]
 pub struct SampleBuffer {
     max: usize,
-    samples: Vec<GostStatsSample>,
+    samples: Vec<StatsSample>,
 }
 
 pub const MAX_BUFFERED_SAMPLES: usize = 1000;
@@ -136,7 +136,7 @@ impl SampleBuffer {
         Self { max, samples: Vec::new() }
     }
 
-    pub fn push(&mut self, sample: GostStatsSample) {
+    pub fn push(&mut self, sample: StatsSample) {
         let key = (sample.service.clone(), sample.client.clone());
         if let Some(existing) = self
             .samples
@@ -172,7 +172,7 @@ impl SampleBuffer {
 
     /// Take the next chunk; on upload failure keep the remainder for retry
     /// (call `keep`), on success drop it (`commit`).
-    pub fn next_chunk(&mut self) -> Vec<GostStatsSample> {
+    pub fn next_chunk(&mut self) -> Vec<StatsSample> {
         let end = self.samples.len().min(STATS_UPLOAD_CHUNK);
         self.samples[..end].to_vec()
     }
@@ -196,8 +196,8 @@ pub fn health_batch(entries: &[ServiceHealthSample]) -> Option<Vec<ServiceHealth
 mod tests {
     use super::*;
 
-    fn sample(service: &str, client: &str, cur: u64, input: u64) -> GostStatsSample {
-        GostStatsSample {
+    fn sample(service: &str, client: &str, cur: u64, input: u64) -> StatsSample {
+        StatsSample {
             service: service.into(),
             client: client.into(),
             total_conns: cur,

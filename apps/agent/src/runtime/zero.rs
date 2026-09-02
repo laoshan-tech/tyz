@@ -24,6 +24,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::ratelimit::{Pacer, Waiter};
+#[cfg(not(target_os = "linux"))]
+use crate::ratelimit::Paced;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 

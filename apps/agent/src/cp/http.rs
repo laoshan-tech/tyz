@@ -77,7 +77,7 @@ impl CpClient {
     /// the health snapshot).
     pub async fn upload_stats(
         &self,
-        samples: &[crate::model::GostStatsSample],
+        samples: &[crate::model::StatsSample],
         health: Option<&[crate::model::ServiceHealthSample]>,
     ) -> Result<(), String> {
         let body = StatsBatch {

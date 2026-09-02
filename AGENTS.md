@@ -100,7 +100,7 @@ rule status auto-sync: the stats ingest also derives relay_rules.status from the
 
 ### Agent modules (`apps/agent`, Rust)
 
-- `main.rs` — env config, tracing (`DEBUG=true` → debug logs; `GOST_API_ADDR` is obsolete and warned about), rustls/ring provider install, control loop until SIGTERM/SIGINT (final stats flush + service shutdown). `--version` prints the build-stamped version (`TYZ_VERSION` compile-time env, `dev` when unset; stamped by the release workflow / Docker build-arg).
+- `main.rs` — env config, tracing (`DEBUG=true` → debug logs), rustls/ring provider install, control loop until SIGTERM/SIGINT (final stats flush + service shutdown). `--version` prints the build-stamped version (`TYZ_VERSION` compile-time env, `dev` when unset; stamped by the release workflow / Docker build-arg).
 - `agentcfg.rs` — env/dotenv loading; variable names mirror the legacy Go agent one-for-one.
 - `model.rs` — wire types mirroring `@tyz/shared` (`RealmNodeConfig`; stats samples with camelCase serde rename; WS push messages).
 - `translate.rs` — `RealmNodeConfig` → desired service set. All validation happens here (address parsing, LB shape, TLS-without-material); a rejected config keeps the previous one serving and the version is not adopted.

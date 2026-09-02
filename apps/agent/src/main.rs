@@ -2,7 +2,7 @@
 
 fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("tyz-agent {}", tyz_agent::VERSION);
+        println!("{}", tyz_agent::VERSION);
         return;
     }
     let cfg = match tyz_agent::agentcfg::AgentConfig::from_env() {
@@ -23,11 +23,6 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
         )
         .init();
-
-    // GOST_API_ADDR died with GOST; warn once so stale deployments notice.
-    if std::env::var("GOST_API_ADDR").map(|v| !v.trim().is_empty()).unwrap_or(false) {
-        tracing::warn!("GOST_API_ADDR is obsolete (no local admin API) and ignored");
-    }
 
     tracing::info!(
         version = tyz_agent::VERSION,

@@ -37,11 +37,11 @@ pub async fn run(cfg: agentcfg::AgentConfig) {
 
     // Offline bootstrap: replay the cached config so a node survives a
     // control-plane outage; its version becomes the polling baseline (an
-    // unchanged config then costs exactly one 304). A gost-era or corrupt
+    // unchanged config then costs exactly one 304). A stale or corrupt
     // cache is skipped — fresh start.
     let mut baseline_version: i64 = 0;
     if let Some(cached) = store::load() {
-        // A pre-realm (gost-era) cache decodes into an empty service set, so
+        // A pre-realm cache decodes into an empty service set, so
         // applying it is equivalent to starting from scratch — either way
         // nothing serves until the first successful fetch.
         if let Some(material) = &cached.config.tls_material {

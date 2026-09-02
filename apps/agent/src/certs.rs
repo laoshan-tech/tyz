@@ -2,8 +2,8 @@
 //! directory. Content-unchanged skips; any change flips the returned flag so
 //! the runtime force-rebuilds TLS services (rustls configs embed the parsed
 //! certificates — without the rebuild a rotated PEM would only load after a
-//! process restart). GOST parsed cert files at service-parse time; kaminari
-//! does the same, hence the identical discipline.
+//! process restart) — kaminari also embeds the parsed certificates, hence
+//! the identical discipline.
 
 use std::fs;
 use std::io;

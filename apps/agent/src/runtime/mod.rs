@@ -1,8 +1,8 @@
-//! Supervisor: registry-diff apply over managed services — the moral
-//! successor of gostapply, with realm-appropriate connection semantics
-//! (config changes keep live connections; only TLS rotation and the manual
-//! restart directive drop them). A dead accept loop (fatal accept error)
-//! self-heals on the next apply without touching established connections.
+//! Supervisor: registry-diff apply over managed services, with
+//! realm-appropriate connection semantics (config changes keep live
+//! connections; only TLS rotation and the manual restart directive drop
+//! them). A dead accept loop (fatal accept error) self-heals on the next
+//! apply without touching established connections.
 
 pub mod net;
 pub mod service;
@@ -37,9 +37,9 @@ impl ApplyOutcome {
 
 pub struct Supervisor {
     running: HashMap<String, ServiceHandle>,
-    /// The last DESIRED set (sorted, failures included) — mirrors gostapply's
-    /// `a.last`: retries rebuild only the failed services, and the manual
-    /// restart directive rebuilds from here instead of re-fetching.
+    /// The last DESIRED set (sorted, failures included): retries rebuild only
+    /// the failed services, and the manual restart directive rebuilds from
+    /// here instead of re-fetching.
     last: Vec<DesiredService>,
     /// (name, error) of services that failed the LAST apply (bind/build).
     failures: Vec<(String, String)>,
@@ -106,7 +106,7 @@ impl Supervisor {
             let svc = desired_map.remove(&name).unwrap();
             match self.running.remove(&name) {
                 Some(old) => {
-                    // Dead-listener self-heal (gostapply's dead-service rule):
+                    // Dead-listener self-heal:
                     // an accept loop that died on a fatal accept error must be
                     // rebuilt even when the config is unchanged — otherwise a
                     // service would stay dead until the next config edit.

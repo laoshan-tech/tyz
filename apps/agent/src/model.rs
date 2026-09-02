@@ -103,7 +103,7 @@ pub struct TlsMaterial {
 /// a process lifetime (a restart re-anchors server-side, see traffic.ts).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GostStatsSample {
+pub struct StatsSample {
     pub service: String,
     /// Empty string = service-level sample (the ONLY kind the billing ledger
     /// consumes); a client IP = per-client breakdown row.
@@ -130,7 +130,7 @@ pub struct ServiceHealthSample {
 /// `null` — the zod schema tolerates null, but [] is what we promise).
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsBatch {
-    pub samples: Vec<GostStatsSample>,
+    pub samples: Vec<StatsSample>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<Vec<ServiceHealthSample>>,
 }
