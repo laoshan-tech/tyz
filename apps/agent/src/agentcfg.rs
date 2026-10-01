@@ -3,9 +3,11 @@
 
 use std::time::Duration;
 
-/// Cloudflare's edge closes WebSockets idle > ~100s; the ping interval must
-/// stay strictly below (the Go agent clamps at 90s).
-const MAX_PING_INTERVAL: Duration = Duration::from_secs(89);
+/// Node heartbeat cadence — deliberately NOT configurable: one fixed value
+/// keeps the server-side offline threshold (5 min) a simple constant and the
+/// fleet uniform. 60s stays well under Cloudflare's ~100s idle-socket close
+/// (the WS heartbeat doubles as the keepalive frame).
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -15,7 +17,6 @@ pub struct AgentConfig {
     pub stats_flush_interval: Duration,
     pub ws_enabled: bool,
     pub ws_probe_interval: Duration,
-    pub ws_ping_interval: Duration,
     pub debug: bool,
 }
 
@@ -59,11 +60,6 @@ impl AgentConfig {
         }
         let node_token = env_str("NODE_TOKEN")?;
 
-        let mut ws_ping_interval = env_ms("WS_PING_INTERVAL_MS", 60_000)?;
-        if ws_ping_interval > MAX_PING_INTERVAL {
-            ws_ping_interval = MAX_PING_INTERVAL;
-        }
-
         Ok(Self {
             control_plane_url: url,
             node_token,
@@ -73,15 +69,63 @@ impl AgentConfig {
                 .map(|v| !v.trim().eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
             ws_probe_interval: env_ms("WS_PROBE_INTERVAL_MS", 60_000)?,
-            ws_ping_interval,
-            debug: std::env::var("DEBUG").map(|v| v.trim() == "true").unwrap_or(false),
+            debug: std::env::var("DEBUG")
+                .map(|v| v.trim() == "true")
+                .unwrap_or(false),
         })
+    }
+
+    /// Push-channel URL for the WS client. CONTROL_PLANE_URL is an http(s)
+    /// base shared with the HTTP client; tungstenite only accepts ws/wss
+    /// schemes (the Go agent's dialer converted silently), so convert here.
+    pub fn ws_url(&self) -> String {
+        let base = if let Some(rest) = self.control_plane_url.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = self.control_plane_url.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            self.control_plane_url.clone()
+        };
+        format!("{base}/api/agent/ws")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg_with_url(url: &str) -> AgentConfig {
+        AgentConfig {
+            control_plane_url: url.to_string(),
+            node_token: String::new(),
+            poll_interval: Duration::from_secs(10),
+            stats_flush_interval: Duration::from_secs(60),
+            ws_enabled: true,
+            ws_probe_interval: Duration::from_secs(60),
+            debug: false,
+        }
+    }
+
+    #[test]
+    fn ws_url_converts_http_schemes() {
+        assert_eq!(
+            cfg_with_url("https://example.com").ws_url(),
+            "wss://example.com/api/agent/ws"
+        );
+        assert_eq!(
+            cfg_with_url("http://127.0.0.1:8787").ws_url(),
+            "ws://127.0.0.1:8787/api/agent/ws"
+        );
+        // explicit ws/wss and scheme-less bases pass through untouched
+        assert_eq!(
+            cfg_with_url("wss://example.com").ws_url(),
+            "wss://example.com/api/agent/ws"
+        );
+        assert_eq!(
+            cfg_with_url("ws://127.0.0.1:8787").ws_url(),
+            "ws://127.0.0.1:8787/api/agent/ws"
+        );
+    }
 
     #[test]
     fn malformed_numbers_are_errors_not_fallbacks() {
@@ -90,6 +134,9 @@ mod tests {
         let err = env_ms("TYZ_TEST_MS", 1000).unwrap_err();
         assert!(err.contains("not a valid number"));
         unsafe { std::env::remove_var("TYZ_TEST_MS") };
-        assert_eq!(env_ms("TYZ_TEST_MS", 1000).unwrap(), Duration::from_millis(1000));
+        assert_eq!(
+            env_ms("TYZ_TEST_MS", 1000).unwrap(),
+            Duration::from_millis(1000)
+        );
     }
 }

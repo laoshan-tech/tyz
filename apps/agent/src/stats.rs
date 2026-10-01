@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::model::{StatsSample, ServiceHealthSample};
+use crate::model::StatsSample;
 
 #[derive(Debug, Default)]
 pub struct Counters {
@@ -89,7 +89,9 @@ impl StatsRegistry {
             c.total_conns.fetch_add(1, Ordering::Relaxed);
             c.current_conns.fetch_add(1, Ordering::Relaxed);
         }
-        ConnGuard { counters: [svc, cli] }
+        ConnGuard {
+            counters: [svc, cli],
+        }
     }
 
     /// One cumulative sample per key. Cheap: reads atomics under a short lock.
@@ -109,7 +111,11 @@ impl StatsRegistry {
             .collect();
         // Service-level rows first — the billing ledger consumes them and
         // should never be dropped by the buffer cap before client rows.
-        samples.sort_by(|a, b| a.client.cmp(&b.client).then_with(|| a.service.cmp(&b.service)));
+        samples.sort_by(|a, b| {
+            a.client
+                .cmp(&b.client)
+                .then_with(|| a.service.cmp(&b.service))
+        });
         samples
     }
 }
@@ -133,7 +139,10 @@ pub const STATS_UPLOAD_CHUNK: usize = 20;
 
 impl SampleBuffer {
     pub fn new(max: usize) -> Self {
-        Self { max, samples: Vec::new() }
+        Self {
+            max,
+            samples: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, sample: StatsSample) {
@@ -183,15 +192,6 @@ impl SampleBuffer {
     }
 }
 
-/// Full health snapshot attached to the first chunk of each flush.
-pub fn health_batch(entries: &[ServiceHealthSample]) -> Option<Vec<ServiceHealthSample>> {
-    if entries.is_empty() {
-        None
-    } else {
-        Some(entries.to_vec())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,11 +214,11 @@ mod tests {
         {
             let _guard = reg.on_conn("service-1", "1.2.3.4");
             let counters = _guard.counters();
-        for c in counters {
-            assert_eq!(c.total_conns.load(Ordering::Relaxed), 1);
-            assert_eq!(c.current_conns.load(Ordering::Relaxed), 1);
-            c.input_bytes.fetch_add(100, Ordering::Relaxed);
-        }
+            for c in counters {
+                assert_eq!(c.total_conns.load(Ordering::Relaxed), 1);
+                assert_eq!(c.current_conns.load(Ordering::Relaxed), 1);
+                c.input_bytes.fetch_add(100, Ordering::Relaxed);
+            }
         } // guard dropped
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 2); // service-level + per-client

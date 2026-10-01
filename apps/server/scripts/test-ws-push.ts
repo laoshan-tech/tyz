@@ -8,8 +8,9 @@
  * (default admin/admin123 — created through /api/setup when the instance is
  * still uninitialized, mirroring the first-run wizard).
  *
- * Verifies: bad token rejected; hello on connect; ping/pong keepalive;
- * an admin write broadcasts {"type":"config_changed"} to the node's socket.
+ * Verifies: bad token rejected; hello on connect; heartbeat/pong round-trip
+ * (the agent's keepalive frame carries the service snapshot); an admin write
+ * broadcasts {"type":"config_changed"} to the node's socket.
  */
 // Plain console output: this script runs standalone against a wrangler dev
 // instance and has no workspace imports.
@@ -78,10 +79,11 @@ async function main(): Promise<void> {
   await waitFor(() => good.messages.some((m) => m.includes('"hello"')), 3000, "hello frame");
   logger.info("PASS: connected and received hello");
 
-  // 3. Keepalive round-trip.
-  good.socket.send("ping");
+  // 3. Heartbeat round-trip: the beat must be answered with "pong" (the DO
+  //    stamps liveness + folds the service snapshot before replying).
+  good.socket.send(JSON.stringify({ type: "heartbeat", health: [] }));
   await waitFor(() => good.messages.includes("pong"), 3000, "pong reply");
-  logger.info("PASS: ping/pong keepalive");
+  logger.info("PASS: heartbeat/pong round-trip");
 
   // 4. Admin write must broadcast config_changed to this socket.
   const update = await fetch(`${baseUrl}/api/admin/nodes/1`, {

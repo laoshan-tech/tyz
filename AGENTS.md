@@ -48,26 +48,46 @@ agent keeps WS GET /api/agent/ws (Bearer NODE_TOKEN) ── {"type":"config_chan
         └─ 200 { version, config: RealmNodeConfig }
               └─► translate (validate) ──► Supervisor::apply (service diff, in-process)
 
+heartbeat (separate from traffic reporting by design):
+  ws mode  ── the WS session's keepalive tick (FIXED 60s, agentcfg::HEARTBEAT_INTERVAL,
+             first beat fires immediately on connect) sends {"type":"heartbeat","health":[...]}
+             over the push socket; the DO replies "pong" (any inbound frame feeds the
+             agent's read watchdog, 2× interval) and stamps liveness
+  poll mode / WS_ENABLED=false ── the control loop POSTs the same payload to
+             /api/agent/heartbeat every 60s
+  ingest (services/health.ts, one fn for both transports):
+    - sentinel upsert service_health(service='__heartbeat__', state='ready') ── node liveness;
+      name can never collide with service-{id}/service-t{id}; filtered out of every read path
+    - full service snapshot upsert (chunk 16)
+    - UNCONDITIONAL diff-delete of services absent from the snapshot (empty snapshot =
+      world emptied → clears all real rows; the sentinel is always "reported")
+    - rule status write-back (tunnel-authorized via nodeRuleTunnels)
+  panel liveness: dashboardSummary derives nodes_health.online server-side
+    (last_report within 5 min = OFFLINE_AFTER_MS); the web renders five states —
+    未上报 (no rows) / 离线 (!online) / 异常 (online + failed>0) / 空闲 (online, 0 services)
+    / x/y 就绪; failed counts only mean something while online
+
 WS channel policy (apps/agent/src/cp/ws.rs): mirrors the legacy Go agent —
   - healthy WS ⇒ HTTP poll is a 5-min safety net only
   - every successful (re)connect fires `Connected` → an immediate poll (a
     config_changed broadcast during a disconnect window is lost; the gap is
     closed on reconnect)
-  - ≥3 WS failures within 60s → fallback to HTTP polling (POLL_INTERVAL_MS + backoff)
+  - ≥3 WS failures within 60s → fallback to HTTP polling (POLL_INTERVAL_MS + backoff);
+    while fallen back the heartbeat switches to POST /api/agent/heartbeat
   - while fallen back: fixed-interval probe promotes back to ws mode; a
     successful handshake ALSO clears the failure window and promotes
-  - keepalive: text "ping" every WS_PING_INTERVAL_MS (clamped < 90s — the
-    edge closes idle WebSockets > ~100s); the DO auto-responds "pong" at the
-    edge without waking the object
+  - keepalive = the heartbeat message itself (60s < the edge's ~100s idle
+    close); legacy text "ping" is still auto-answered "pong" at the edge via
+    setWebSocketAutoResponse so a not-yet-restarted agent never flap-loops
   - manual rule restart: the panel's POST /rules/:id/restart broadcasts
     {"type":"restart_service","service":"service-{id}"}; the Supervisor
     rebuilds that ONE service from the last desired config (dropping its
     live connections); unknown names no-op
-  - shutdown: signal → final stats flush → stop services
+  - shutdown: signal → final stats flush → stop services (no goodbye beat;
+    the offline threshold flips the node naturally)
 
 Supervisor data plane ──► per-service accept loops + splice/userland bidi copy
-  ──► cumulative counters (service-level + per-client) ──► POST /api/agent/stats (batched, idle-skip)
-  ──► service health snapshot rides the first chunk of each flush ──► D1 service_health
+  ──► cumulative counters (service-level + per-client) ──► POST /api/agent/stats (batched, idle-skip, samples ONLY)
 stats ingest (traffic.ts) ──► deltas vs traffic_counters ──► D1 traffic_hourly (per rule-hour ledger, billing SoT)
 billing authorization: the sample's service string is attacker-controlled, so a
   service-{ruleId} sample only enters the rule ledger when the REPORTING node
@@ -80,7 +100,8 @@ D1 chunking: every batched write/IN-list is chunked to stay under D1's 100 bound
   ingest writes are MULTI-ROW upserts — traffic_hourly 12 rows @8 params, traffic_counters
   16 @5, service_metrics_hourly 16 @6, per-rule observation increments as one CASE-based
   UPDATE per 16-rule chunk)
-rule status auto-sync: the stats ingest also derives relay_rules.status from the health snapshot —
+rule status auto-sync: the HEARTBEAT ingest (not the stats ingest) derives
+  relay_rules.status from the service snapshot —
   running/ready → running, failed/apply_failed → error; `paused` (manual) is never
   overwritten; absent services keep their status
 ```
@@ -89,8 +110,9 @@ rule status auto-sync: the stats ingest also derives relay_rules.status from the
 
 - `index.ts` — Hono app, mounts `/agent` and `/admin`, SPA fallback via `env.ASSETS`, daily cron pruning `gost_stats` (>30 days) and `audit_log` (>180 days; the hourly traffic ledger is NEVER pruned — permanent packages need unbounded windows) + recomputing every node config (quota sweep: expired subscriptions / drained allowances hard-stop their rules; unchanged configs skip the version bump). Exports `AppType` and the `NodePushDO` class.
 - `services/quota.ts` — package/subscription enforcement: the server is the billing ledger (per-user usage = SUM of billed bytes from the `traffic_hourly` ledger within the subscription window; window start floored to its hour), the agent has NO in-path quota gate — enforcement is config removal at recompute time. Usage is ONE aggregate roundtrip per user; multi-user batches resolve decisions in parallel; the user-detail per-rule breakdown is a chunked GROUP BY (`ruleUsageByRule`). Hard-stop (rule dropped from the rendered payload) on disabled user / no subscription / expired / exhausted. `quotaSweepStoppedUsers` (flush-driven R4 mitigation) resolves hard-stop decisions for the users whose rules just billed traffic and returns those whose rules are STILL deployed in some node config — the stats route recomputes their nodes, shrinking the over-delivery window from one cron period to one flush interval; idempotent via the deployment scan, daily cron remains the backstop. Switching/renewing a subscription replaces its row with a fresh `activated_at` — the window change restarts usage accounting (换购清零).
-- `routes/agent.ts` — node-facing endpoints; auth via `middleware/nodeAuth.ts` (Bearer token → direct plaintext lookup on `relay_nodes.token` (UNIQUE), 60s in-isolate cache). `GET /ws` forwards the authenticated upgrade request to the node's `NodePushDO`. `POST /stats` shares one `nodeRuleTunnels` lookup between the billing gate and the status write-back; schedules the quota sweep via `waitUntil`.
-- `do/nodePush.ts` — `NodePushDO` (one Durable Object instance per node, `idFromName(String(nodeId))`): hibernation WebSocket API, auto-responds to `ping`→`pong` at the edge (`setWebSocketAutoResponse`, object stays hibernated), and on `POST /notify` broadcasts `{"type":"config_changed"}` / restart directives to all live sockets of that node. Bound as `CONFIG_PUSH` in wrangler.jsonc (SQLite class migration `v2_node_push_do`).
+- `routes/agent.ts` — node-facing endpoints; auth via `middleware/nodeAuth.ts` (Bearer token → direct plaintext lookup on `relay_nodes.token` (UNIQUE), 60s in-isolate cache). `GET /ws` forwards the authenticated upgrade request to the node's `NodePushDO`. `POST /stats` is traffic samples ONLY (the billing gate via `nodeRuleTunnels`; schedules the quota sweep via `waitUntil`); `POST /heartbeat` takes the service snapshot (shared `ingestHealthSnapshot` with the DO's WS path).
+- `services/health.ts` — `ingestHealthSnapshot`: the ONE health ingest for both heartbeat transports (DO WS message + POST /heartbeat). Stamps the `__heartbeat__` sentinel row (node liveness, no schema change), upserts the service snapshot (chunk 16), runs the UNCONDITIONAL diff-delete (an empty snapshot clears the node's real rows — the sentinel is always "reported"), and writes rule status back (tunnel-authorized, positive evidence only, `paused` untouched). `OFFLINE_AFTER_MS` (5 min) is the single offline threshold the dashboard derives `online` from.
+- `do/nodePush.ts` — `NodePushDO` (one Durable Object instance per node, `idFromName(String(nodeId))`): hibernation WebSocket API, `webSocketMessage` handles the agent's heartbeat (`pong` FIRST — the agent's watchdog only needs a frame — then liveness stamp + snapshot ingest; D1 failures self-heal next beat), auto-responds to legacy `ping`→`pong` at the edge (`setWebSocketAutoResponse` — kept so a not-yet-restarted agent never flap-loops), and on `POST /notify` broadcasts `{"type":"config_changed"}` / restart directives to all live sockets of that node. Bound as `CONFIG_PUSH` in wrangler.jsonc (SQLite class migration `v2_node_push_do`).
 - `services/notify.ts` — `notifyConfigChanged(env, nodeIds)`: fire-and-forget fan-out to the DOs; never fails the admin write.
 - `services/recompute.ts` — shared recompute helpers used by admin routes and the agent stats route: `recomputeAndNotify` (one node), `recomputeTunnelNodes` (parallel over the tunnel's chain nodes), `recomputeUserNodes` (every node serving a user's rules). `recomputeNodeConfig` (in `db/repo.ts`) is content-diffed: an unchanged config skips the version bump, so sweeps never force pointless refetches.
 - `services/tls.ts` — platform link-TLS material: a self-signed ECDSA P-256 CA plus server/client leaves, generated in-process with a hand-rolled minimal DER encoder (Workers has no X.509 library). Stored as PEM in `tls_material` (kind = ca|server|client); `ensureTlsMaterial` lazy-generates on first TLS aggregation; `setTlsDomain`/`setTlsProfile` issue eagerly; `renewTlsMaterial` (daily cron) re-issues expiring material and recomputes the TLS-enabled nodes. The certificate profile (issuer DN strings + validity) is admin-configurable (`PUT /api/admin/settings/tls-profile`). The disguise domain (`app_settings.tls_domain`) is set from the settings page; `GET /api/admin/tls/status` shows expiry metadata + effective profile. **PEM material and `relay_auth_*` are secrets of the node-token trust domain: delivered only through the agent config payload, never in admin responses or audit rows.** Cert correctness is covered by `apps/server/test/tls.test.ts` (DER parse + WebCrypto signature self-checks).
@@ -110,11 +132,11 @@ rule status auto-sync: the stats ingest also derives relay_rules.status from the
 - `runtime/zero.rs` — the ~150-line counted splice state machine (realm_io v0.5.4 semantics: same pipe sizing 16×4K, `SPLICE_F_MOVE|SPLICE_F_NONBLOCK`, brutal-shutdown completion policy — one direction done closes the other at its current byte count). Bytes are counted at the write-splice, so billing never leaves the zero-copy path; the same write-splices are the rate-limit insertion point (the pacer caps each slice's length and parks the direction when its token buckets run dry — bytes stay in the kernel). Non-Linux dev runs fall back to userland copy. Unit tests compare totals against realm_io's own `bidi_zero_copy` and assert pacing actually throttles.
 - `runtime/tlsconf.rs` — kaminari TLS assembly: exits serve the platform server cert; entries dial with SNI = platform domain + payload ALPN. kaminari's client has no custom-CA option, so the entry leg runs `insecure` (encryption without server verification — an accepted tradeoff, design doc §11; the gost-era mTLS/relay-auth/admission layers are retired with GOST).
 - `certs.rs` — persists the platform PEM material to `certs/` (atomic tmp+fsync+rename, 0700/0600, content-unchanged skips); the changed flag gates the TLS force-rebuild (rustls embeds certs at acceptor-build time).
-- `cp/http.rs` — versioned config fetch (304 handling, 8MB response cap, 30s timeout) and batched stats upload.
-- `cp/ws.rs` — WS push channel state machine (see diagram above).
+- `cp/http.rs` — versioned config fetch (304 handling, 8MB response cap, 30s timeout), batched sample upload (POST /stats), and the poll-mode heartbeat (POST /heartbeat).
+- `cp/ws.rs` — WS push channel state machine (see diagram above). The session's keepalive tick IS the heartbeat: `{"type":"heartbeat","health":[...]}` every HEARTBEAT_INTERVAL, first beat immediately on connect, watchdog 2× interval.
 - `stats.rs` — cumulative per-(service × client) atomic counters + the flush buffer (merge-by-key keeping the intra-window `current_conns` peak, cap 1000 with drop-oldest, ≤20-sample chunks; service-level rows sort first so the billing rows survive the cap).
 - `store.rs` — offline bootstrap cache `last-config.toml` (atomic write, 0600). TOML serialization of the same wire model — doubles as a human-readable dump of the applied config.
-- `control.rs` — the control loop (poll cadence by channel mode, backoff ×2 max 5min ±20% jitter, restart directives, version adopted only on fully successful apply) and the flush loop (random startup phase; buffer-merge; ≤20-sample chunked upload with remainder-keep retry).
+- `control.rs` — the control loop (poll cadence by channel mode, backoff ×2 max 5min ±20% jitter, restart directives, version adopted only on fully successful apply; poll-mode heartbeat POST every fixed 60s) and the flush loop (random startup phase; buffer-merge; ≤20-sample chunked upload with remainder-keep retry; traffic samples only — idle uploads nothing).
 
 ## Critical Implementation Details
 
@@ -156,7 +178,7 @@ The realm payload carries no quota object (the gost quota limiter died with GOST
 - Counters are CUMULATIVE per (service, client) within a process lifetime; the server folds telescoping deltas against `traffic_counters` (counter resets re-anchor). Lost uploads therefore never double-count; a restart re-anchors server-side.
 - `traffic_hourly` (per rule-hour, PK `(rule_id, hour_ts)`) is the billing ledger: ledger-first UPSERT accumulation (`real_*` actual bytes, `billed_*` = round(real × node `rate`) — the line billing multiplier, 0..100 default 1.0, 0 = record-only; quota remaining computed from BILLED). Deliberately NO foreign keys: deleting a rule/user must not erase usage. Writes go ledger-first so a crash over-counts instead of under-counting.
 - `service_metrics_hourly` rolls up per-service connection samples hourly (sum+samples for exact averages, max for peaks; 7-day retention, no FK).
-- `service_health` is the panel's liveness signal (`reported_at` refreshed by every flush); rows absent from a node's snapshot are deleted (diffed, NOT `NOT IN` — chunking trap).
+- `service_health` holds the service-state snapshot AND the node-liveness sentinel (`service='__heartbeat__'`, one row per node — `reported_at` refreshed by every heartbeat). Snapshot rows absent from a node's beat are deleted (diffed, NOT `NOT IN` — chunking trap); an EMPTY snapshot clears all real rows but keeps the sentinel. Read paths (dashboard counts, `/nodes/:id/health`) filter the sentinel; `dashboardSummary` derives `nodes_health.online` from it server-side (within `OFFLINE_AFTER_MS` = 5 min) — the web never compares clocks itself.
 - The billing gate (`nodeRuleTunnels`) authorizes per-rule samples by the reporting node's chains — IN and OUT links both deploy per-rule services under raw semantics, so both legs bill by design; operators trim legs via per-node `rate`.
 
 ### Database schema quirks
@@ -177,14 +199,14 @@ The realm payload carries no quota object (the gost quota limiter died with GOST
 
 ## Environment Variables
 
-Agent (`apps/agent/.env.example`, loaded from the working directory; real env vars take precedence): `CONTROL_PLANE_URL`, `NODE_TOKEN` (required); `POLL_INTERVAL_MS` (10000), `STATS_FLUSH_INTERVAL_MS` (60000), `WS_ENABLED` (true; false = pure HTTP polling), `WS_PROBE_INTERVAL_MS` (60000), `WS_PING_INTERVAL_MS` (60000, clamped < 90s), `DEBUG` (verbose logs). 
+Agent (`apps/agent/.env.example`, loaded from the working directory; real env vars take precedence): `CONTROL_PLANE_URL`, `NODE_TOKEN` (required); `POLL_INTERVAL_MS` (10000), `STATS_FLUSH_INTERVAL_MS` (60000), `WS_ENABLED` (true; false = pure HTTP polling), `WS_PROBE_INTERVAL_MS` (60000), `DEBUG` (verbose logs). The heartbeat interval is deliberately NOT configurable (fixed 60s in `agentcfg::HEARTBEAT_INTERVAL`); the retired `WS_PING_INTERVAL_MS` is ignored.
 Server: no required secrets (admin login is DB-backed via `/setup`; local dev is zero-config — seed tokens are plaintext). Production-optional: `SESSION_SECRET` (session-cookie HMAC key) via `wrangler secret put`.
 
 ## HTTP Endpoints
 
-Server: `GET /api/healthz`; agent-facing `GET /api/agent/config?version=N` (304/200, body = `RealmNodeConfig`), `GET /api/agent/ws` (WebSocket upgrade; pushes `{"type":"config_changed"}` / `{"type":"restart_service","service":...}`, auto-answers `ping`→`pong`), `POST /api/agent/stats` (samples + service health snapshot); admin `POST /api/admin/login|logout`, `GET /api/admin/me`, `PUT /api/admin/me/password`, CRUD `/api/admin/nodes|tunnels|chains|rules|users|packages|endpoints` (+`/api/admin/nodes/:id/{recompute,rotate-token,stats,health,metrics,token}`, `/api/admin/users/:id/subscribe` for activate/switch/renew, `GET /api/admin/users/:id` returns the rules' quota status incl. stop reasons, `GET /api/admin/audit`, `POST /api/admin/rules/:id/restart`, `GET /api/admin/tls/status` + `PUT /api/admin/settings/tls-domain` + `PUT /api/admin/settings/tls-profile`).
+Server: `GET /api/healthz`; agent-facing `GET /api/agent/config?version=N` (304/200, body = `RealmNodeConfig`), `GET /api/agent/ws` (WebSocket upgrade; pushes `{"type":"config_changed"}` / `{"type":"restart_service","service":...}`, receives `{"type":"heartbeat","health":[...]}` and answers "pong", legacy `ping` auto-answered at the edge), `POST /api/agent/heartbeat` (liveness + service snapshot; the poll-mode transport of the same ingest), `POST /api/agent/stats` (traffic samples only); admin `POST /api/admin/login|logout`, `GET /api/admin/me`, `PUT /api/admin/me/password`, CRUD `/api/admin/nodes|tunnels|chains|rules|users|packages|endpoints` (+`/api/admin/nodes/:id/{recompute,rotate-token,stats,health,metrics,token}`, `/api/admin/users/:id/subscribe` for activate/switch/renew, `GET /api/admin/users/:id` returns the rules' quota status incl. stop reasons, `GET /api/admin/audit`, `POST /api/admin/rules/:id/restart`, `GET /api/admin/tls/status` + `PUT /api/admin/settings/tls-domain` + `PUT /api/admin/settings/tls-profile`).
 
-Agent: no HTTP surface of its own (a node is considered healthy as long as it keeps reporting; config apply and stats are in-process).
+Agent: no HTTP surface of its own; a node is alive as long as its heartbeat arrives (60s fixed, WS or HTTP), and the panel renders 未上报/离线/异常/空闲/就绪 from the server-derived `online` flag.
 
 ## Code Style
 
@@ -195,10 +217,10 @@ Biome (root `biome.json`) covers the TS workspaces: double quotes, 120 cols, org
 `bun run test:agent` (`cargo test` in apps/agent):
 - zero-copy: counted splice vs realm_io's own `bidi_zero_copy` totals on real socket pairs; brutal-shutdown release of half-dead peers.
 - supervisor: service lifecycle (create / idempotent re-apply), dead-listener self-heal keeping live connections, unchanged-config no-op guard.
-- WS state machine: push delivery + mode recovery against a local WS server; dead-server demotion → probe promotion.
-- e2e: `tests/e2e.rs` (two agents against a mock control plane: config sync, forwarding, stats) and `tests/tls_e2e.rs` (TLS link entry→exit; plaintext probes refused).
+- WS state machine: push delivery + heartbeat beats (first beat fires on connect; the server's pong feeds the watchdog) + mode recovery against a local WS server; dead-server demotion → probe promotion.
+- e2e: `tests/e2e.rs` (two agents against a mock control plane: config sync, forwarding, samples-only stats, heartbeats) and `tests/tls_e2e.rs` (TLS link entry→exit; plaintext probes refused).
 - unit: translate validation, store round-trip, certs write-once/skip-unchanged, stats buffer merge/chunk/cap.
 
-Server-side (bun test under `apps/server/test/`): `crypto.test.ts` (salted-sha256 round-trip), `tls.test.ts` (DER encoder + WebCrypto signature self-checks), `traffic.test.ts` (ledger ingest vs the real D1 migration: delta chaining, counter resets, chunk-boundary splits, forged-service gate), `realm-config.test.ts` (realm renderer: raw port pairs, exit-port allocation, LB candidate sets, TLS legs, legacy relay degradation, multi-hop skips, quota gating, recompute content-diff, billing gate, quota sweep).
+Server-side (bun test under `apps/server/test/`): `crypto.test.ts` (salted-sha256 round-trip), `tls.test.ts` (DER encoder + WebCrypto signature self-checks), `traffic.test.ts` (ledger ingest vs the real D1 migration: delta chaining, counter resets, chunk-boundary splits, forged-service gate), `health.test.ts` (heartbeat ingest vs the real D1 migration: sentinel liveness stamp, snapshot upsert + diff-delete incl. empty-world cleanup, tunnel-authorized rule status write-back), `realm-config.test.ts` (realm renderer: raw port pairs, exit-port allocation, LB candidate sets, TLS legs, legacy relay degradation, multi-hop skips, quota gating, recompute content-diff, billing gate, quota sweep).
 
-Live e2e (needs `wrangler dev` + seed): `bun run apps/server/scripts/test-ws-push.ts` — bad token rejected, hello, ping/pong, admin write broadcasts `config_changed`. For a full local stack: `wrangler dev` + seed + `bun run dev:agent`; send traffic through a rule's listen port and watch stats flow.
+Live e2e (needs `wrangler dev` + seed): `bun run apps/server/scripts/test-ws-push.ts` — bad token rejected, hello, heartbeat/pong, admin write broadcasts `config_changed`. For a full local stack: `wrangler dev` + seed + `bun run dev:agent`; send traffic through a rule's listen port and watch stats flow.

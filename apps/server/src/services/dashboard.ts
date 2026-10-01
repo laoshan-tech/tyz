@@ -1,5 +1,5 @@
 import type { DashboardSummary, DashboardTrafficPoint } from "@tyz/shared";
-import { and, count, gte, lt, sql } from "drizzle-orm";
+import { and, count, eq, gte, lt, ne, sql } from "drizzle-orm";
 import type { Database } from "../db";
 import {
   relayNodes,
@@ -11,6 +11,7 @@ import {
   userPackages,
   users,
 } from "../db/schema";
+import { HEARTBEAT_SERVICE, OFFLINE_AFTER_MS } from "./health";
 import { quotaDecisionsForUsers } from "./quota";
 import { hourFloorIso } from "./traffic";
 
@@ -45,12 +46,14 @@ function dayStartIso(offsetDays: number): string {
 }
 
 export async function dashboardSummary(db: Database): Promise<DashboardSummary> {
-  const [nodeRows, tunnelRows, ruleRows, userRows, subRows, healthRows, peakRows] = await Promise.all([
+  const [nodeRows, tunnelRows, ruleRows, userRows, subRows, healthRows, seenRows, peakRows] = await Promise.all([
     db.select({ id: relayNodes.id, name: relayNodes.name }).from(relayNodes).orderBy(relayNodes.id),
     db.select({ n: count() }).from(tunnels),
     db.select().from(relayRules),
     db.select({ status: users.status, n: count() }).from(users).groupBy(users.status),
     db.select({ n: count() }).from(userPackages),
+    // Service-state counts EXCLUDE the heartbeat sentinel; liveness comes from
+    // the sentinel rows below (one per node, always the freshest row).
     db
       .select({
         node_id: serviceHealth.node_id,
@@ -59,7 +62,12 @@ export async function dashboardSummary(db: Database): Promise<DashboardSummary> 
         last: sql<string | null>`MAX(${serviceHealth.reported_at})`,
       })
       .from(serviceHealth)
+      .where(ne(serviceHealth.service, HEARTBEAT_SERVICE))
       .groupBy(serviceHealth.node_id, serviceHealth.state),
+    db
+      .select({ node_id: serviceHealth.node_id, seen_at: serviceHealth.reported_at })
+      .from(serviceHealth)
+      .where(eq(serviceHealth.service, HEARTBEAT_SERVICE)),
     db
       .select({ node_id: serviceMetricsHourly.node_id, peak: sql<number>`MAX(${serviceMetricsHourly.conn_max})` })
       .from(serviceMetricsHourly)
@@ -101,6 +109,20 @@ export async function dashboardSummary(db: Database): Promise<DashboardSummary> 
   }
   const peakByNode = new Map(peakRows.map((r) => [r.node_id, Number(r.peak ?? 0)]));
 
+  // Liveness: the heartbeat sentinel is the freshest row whenever the agent
+  // beats; service rows only lag it (their reported_at rides the same beat).
+  // MAX(sentinel, service rows) keeps nodes without a sentinel yet (upgrade
+  // window) honest instead of dropping them to 未上报.
+  const nowMs = Date.now();
+  const seenByNode = new Map(seenRows.map((r) => [r.node_id, r.seen_at]));
+  const lastReportOf = (nodeId: number): string | null => {
+    const seen = seenByNode.get(nodeId) ?? null;
+    const svc = healthByNode.get(nodeId)?.last ?? null;
+    if (!seen) return svc;
+    if (!svc) return seen;
+    return seen > svc ? seen : svc;
+  };
+
   const [today, yesterday] = await Promise.all([
     trafficForDay(db, dayStartIso(0), dayStartIso(1)),
     trafficForDay(db, dayStartIso(-1), dayStartIso(0)),
@@ -115,6 +137,7 @@ export async function dashboardSummary(db: Database): Promise<DashboardSummary> 
     },
     nodes_health: nodeRows.map((n) => {
       const h = healthByNode.get(n.id);
+      const lastReport = lastReportOf(n.id);
       return {
         node_id: n.id,
         name: n.name,
@@ -122,7 +145,8 @@ export async function dashboardSummary(db: Database): Promise<DashboardSummary> 
         ready: h?.ready ?? 0,
         failed: h?.failed ?? 0,
         conn_peak_24h: peakByNode.get(n.id) ?? 0,
-        last_report: h?.last ?? null,
+        last_report: lastReport,
+        online: lastReport !== null && nowMs - Date.parse(lastReport) < OFFLINE_AFTER_MS,
       };
     }),
     traffic: { today, yesterday },

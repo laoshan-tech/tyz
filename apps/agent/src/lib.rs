@@ -32,8 +32,12 @@ pub const VERSION: &str = match option_env!("TYZ_VERSION") {
 /// already be installed (see main).
 pub async fn run(cfg: agentcfg::AgentConfig) {
     let stats = stats::StatsRegistry::new();
-    let supervisor: runtime::SharedSupervisor = Arc::new(Mutex::new(runtime::Supervisor::new(stats.clone())));
-    let cp = Arc::new(cp::http::CpClient::new(&cfg.control_plane_url, &cfg.node_token));
+    let supervisor: runtime::SharedSupervisor =
+        Arc::new(Mutex::new(runtime::Supervisor::new(stats.clone())));
+    let cp = Arc::new(cp::http::CpClient::new(
+        &cfg.control_plane_url,
+        &cfg.node_token,
+    ));
 
     // Offline bootstrap: replay the cached config so a node survives a
     // control-plane outage; its version becomes the polling baseline (an
@@ -64,7 +68,9 @@ pub async fn run(cfg: agentcfg::AgentConfig) {
         baseline_version = cached.version;
     }
 
-    // WS push channel → control-loop wakeups.
+    // WS push channel → control-loop wakeups. The WS session's keepalive
+    // tick doubles as the heartbeat ({"type":"heartbeat","health":[...]}); a
+    // poll-mode agent heartbeats from the control loop instead.
     let (wake_tx, wake_rx) = mpsc::channel(64);
     let ws = if cfg.ws_enabled {
         let events = {
@@ -79,9 +85,10 @@ pub async fn run(cfg: agentcfg::AgentConfig) {
         };
         cp::ws::WsChannel::spawn(
             cp::ws::WsOpts {
-                url: format!("{}/api/agent/ws", cfg.control_plane_url),
+                url: cfg.ws_url(),
                 token: cfg.node_token.clone(),
-                ping_interval: cfg.ws_ping_interval,
+                supervisor: supervisor.clone(),
+                heartbeat_interval: agentcfg::HEARTBEAT_INTERVAL,
                 probe_interval: cfg.ws_probe_interval,
             },
             events,
@@ -99,8 +106,8 @@ pub async fn run(cfg: agentcfg::AgentConfig) {
     };
     let control_task = tokio::spawn(control.run(wake_rx, ws));
 
-    // Flush loop + shutdown plumbing.
-    let flush = control::Flush::new(cp.clone(), supervisor.clone(), stats.clone(), cfg.stats_flush_interval);
+    // Flush loop (traffic samples only) + shutdown plumbing.
+    let flush = control::Flush::new(cp.clone(), stats.clone(), cfg.stats_flush_interval);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let flush_task = tokio::spawn(flush.run(shutdown_rx));
 

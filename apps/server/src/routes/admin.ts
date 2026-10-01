@@ -63,6 +63,7 @@ import {
 } from "../middleware/adminAuth";
 import { listAudit, recordAudit } from "../services/audit";
 import { dashboardSummary, dashboardTraffic } from "../services/dashboard";
+import { HEARTBEAT_SERVICE } from "../services/health";
 import { broadcastNodeMessage, notifyConfigChanged } from "../services/notify";
 import { getActiveSubscriptions, quotaDecisionsForUsers, userQuotaSummary } from "../services/quota";
 import { recomputeAndNotify, recomputeTunnelNodes, recomputeUserNodes } from "../services/recompute";
@@ -439,10 +440,14 @@ adminRoutes.get("/nodes/:id/metrics", async (c) => {
   return c.json({ rows });
 });
 
-/** Latest runtime state per service on a node, as reported with stats batches. */
+/** Latest runtime state per service on a node, as reported with heartbeats
+ * (the `__heartbeat__` sentinel row is liveness bookkeeping, not a service). */
 adminRoutes.get("/nodes/:id/health", async (c) => {
   const id = Number(c.req.param("id"));
-  const rows = await createDb(c.env.DB).select().from(serviceHealth).where(eq(serviceHealth.node_id, id));
+  const rows = await createDb(c.env.DB)
+    .select()
+    .from(serviceHealth)
+    .where(and(eq(serviceHealth.node_id, id), ne(serviceHealth.service, HEARTBEAT_SERVICE)));
   return c.json({ rows });
 });
 

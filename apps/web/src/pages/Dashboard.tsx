@@ -7,6 +7,7 @@ import { type ReactNode, useMemo, useState } from "react";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis } from "recharts";
 import { api } from "../api";
 import { formatTraffic } from "../format";
+import { NodeHealthChip, nodeHealthKind } from "../health";
 import { auditActionLabel } from "../labels";
 import { dashboardSummaryOptions } from "../queries";
 import { cn, DataText, PageHeader, PageShell, StatusChip } from "../ui";
@@ -244,7 +245,11 @@ function NodeHealthWall({ nodes, loading }: { nodes: DashboardSummary["nodes_hea
                     stroke={2}
                     className={cn(
                       "shrink-0",
-                      n.failed > 0 ? "text-danger" : n.services === 0 ? "text-muted" : "text-success",
+                      nodeHealthKind(n) === "ready"
+                        ? "text-success"
+                        : nodeHealthKind(n) === "abnormal"
+                          ? "text-danger"
+                          : "text-muted",
                     )}
                   />
                   <div className="min-w-0">
@@ -252,15 +257,7 @@ function NodeHealthWall({ nodes, loading }: { nodes: DashboardSummary["nodes_hea
                     <p className="text-xs text-muted">24h 峰值 {n.conn_peak_24h} 连接</p>
                   </div>
                 </div>
-                {n.failed > 0 ? (
-                  <StatusChip tone="danger">{n.failed} 异常</StatusChip>
-                ) : n.services === 0 ? (
-                  <StatusChip tone="default">未上报</StatusChip>
-                ) : (
-                  <StatusChip tone="success">
-                    {n.ready}/{n.services} 就绪
-                  </StatusChip>
-                )}
+                <NodeHealthChip health={n} />
               </Link>
             ))}
           </div>
@@ -393,11 +390,11 @@ export default function DashboardPage() {
     refetchInterval: REFRESH_MS,
   });
   const summary = summaryQuery.data;
-  const nodeAbnormal = summary?.nodes_health.filter((n) => n.failed > 0).length ?? 0;
-  const nodeOffline = summary?.nodes_health.filter((n) => n.services === 0).length ?? 0;
+  const nodeAbnormal = summary?.nodes_health.filter((n) => nodeHealthKind(n) === "abnormal").length ?? 0;
+  const nodeOffline = summary?.nodes_health.filter((n) => nodeHealthKind(n) === "offline").length ?? 0;
   const nodeHint = [
     nodeAbnormal > 0 ? `${nodeAbnormal} 个服务异常` : null,
-    nodeOffline > 0 ? `${nodeOffline} 个未上报` : null,
+    nodeOffline > 0 ? `${nodeOffline} 个离线` : null,
   ]
     .filter(Boolean)
     .join(" · ");

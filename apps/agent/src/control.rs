@@ -5,7 +5,9 @@
 //! failures back off exponentially (×2, max 5 min, ±20% jitter) and reset on
 //! any successful poll (200 or 304). The flush loop's startup phase is
 //! randomized so a fleet started together never hits the stats endpoint in
-//! lockstep.
+//! lockstep. The heartbeat lives OUTSIDE the flush loop: in ws mode the WS
+//! session's own tick carries it (cp::ws), in poll mode the control loop
+//! POSTs it — traffic samples and liveness never share a cadence gate.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,8 +18,8 @@ use crate::agentcfg::AgentConfig;
 use crate::cp::http::{CpClient, Fetched};
 use crate::cp::ws::{Mode, WsChannel, WsEvent};
 use crate::runtime::SharedSupervisor;
-use crate::stats::{health_batch, SampleBuffer, StatsRegistry, MAX_BUFFERED_SAMPLES};
-use crate::{certs, store};
+use crate::stats::{SampleBuffer, StatsRegistry, MAX_BUFFERED_SAMPLES};
+use crate::{agentcfg, certs, store};
 
 const SAFETY_NET_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
@@ -106,6 +108,15 @@ impl Control {
 
     pub async fn run(mut self, mut wake: tokio::sync::mpsc::Receiver<Wake>, ws: WsChannel) {
         let mut backoff: Option<Duration> = None;
+        // Poll-mode heartbeat: while the WS session is down (or WS is
+        // disabled) the control loop carries the liveness beat over HTTP.
+        // In ws mode the session's own tick sends it — the loop skips.
+        let mut heartbeat_tick = tokio::time::interval(agentcfg::HEARTBEAT_INTERVAL);
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick: unlike the WS session (whose first
+        // beat stamps liveness right after the handshake), a poll-mode agent
+        // just started — its first beat rides the normal cadence.
+        heartbeat_tick.tick().await;
 
         loop {
             let base = if ws.mode() == Mode::Ws {
@@ -117,6 +128,15 @@ impl Control {
 
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
+                _ = heartbeat_tick.tick() => {
+                    if ws.mode() == Mode::Poll {
+                        let health = self.supervisor.lock().await.health_snapshot();
+                        if let Err(err) = self.cp.upload_heartbeat(&health).await {
+                            tracing::warn!("heartbeat upload failed: {err}");
+                        }
+                    }
+                    continue;
+                }
                 msg = wake.recv() => match msg {
                     Some(Wake::WsEvent(WsEvent::ConfigChanged)) => {
                         tracing::debug!("push: config_changed");
@@ -153,22 +173,21 @@ impl Control {
     }
 }
 
-/// Flush loop: snapshot counters + health, buffer-merge, chunked upload with
-/// remainder-keep retry. `flush()` is public for the graceful-shutdown final
-/// pass and tests.
+/// Flush loop: snapshot counters, buffer-merge, chunked upload with
+/// remainder-keep retry. Traffic samples ONLY — the service snapshot and
+/// liveness live on the heartbeat channel. `flush()` is public for the
+/// graceful-shutdown final pass and tests.
 pub struct Flush {
     pub cp: Arc<CpClient>,
-    pub supervisor: SharedSupervisor,
     pub stats: Arc<StatsRegistry>,
     pub interval: Duration,
     buffer: SampleBuffer,
 }
 
 impl Flush {
-    pub fn new(cp: Arc<CpClient>, supervisor: SharedSupervisor, stats: Arc<StatsRegistry>, interval: Duration) -> Self {
+    pub fn new(cp: Arc<CpClient>, stats: Arc<StatsRegistry>, interval: Duration) -> Self {
         Self {
             cp,
-            supervisor,
             stats,
             interval,
             buffer: SampleBuffer::new(MAX_BUFFERED_SAMPLES),
@@ -178,7 +197,9 @@ impl Flush {
     pub async fn run(mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         // Random startup phase (0..interval): a fleet started together must
         // not hit the stats endpoint in lockstep.
-        let phase = Duration::from_millis(rand::thread_rng().gen_range(0..self.interval.as_millis() as u64));
+        let phase = Duration::from_millis(
+            rand::thread_rng().gen_range(0..self.interval.as_millis() as u64),
+        );
         tokio::select! {
             _ = tokio::time::sleep(phase) => {}
             _ = shutdown.changed() => {}
@@ -203,31 +224,19 @@ impl Flush {
     }
 
     /// One flush pass: snapshot → merge into buffer → upload in ≤20-sample
-    /// chunks (D1's bound-parameter cap); the first chunk carries the health
-    /// snapshot; a failed chunk keeps the remainder buffered for next pass.
+    /// chunks (D1's bound-parameter cap); a failed chunk keeps the remainder
+    /// buffered for next pass. Idle (empty buffer) uploads nothing.
     pub async fn flush(&mut self) -> Result<(), String> {
         for sample in self.stats.snapshot() {
             self.buffer.push(sample);
         }
-        let health = {
-            let supervisor = self.supervisor.lock().await;
-            supervisor.health_snapshot()
-        };
-        let health = health_batch(&health);
-
-        let mut first = true;
         while !self.buffer.is_empty() {
             let chunk = self.buffer.next_chunk();
-            let h = if first { health.as_deref() } else { None };
-            match self.cp.upload_stats(&chunk, h).await {
-                Ok(()) => {
-                    self.buffer.commit_chunk(chunk.len());
-                    first = false;
-                }
+            match self.cp.upload_stats(&chunk).await {
+                Ok(()) => self.buffer.commit_chunk(chunk.len()),
                 Err(err) => return Err(err),
             }
         }
         Ok(())
     }
 }
-

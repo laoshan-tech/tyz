@@ -1,10 +1,10 @@
-//! Control-plane HTTP client: versioned config fetch (304 when unchanged) and
-//! batched stats upload. One batch per call — chunking/retry lives in the
-//! flush loop.
+//! Control-plane HTTP client: versioned config fetch (304 when unchanged),
+//! batched traffic-sample upload, and the poll-mode heartbeat. One batch per
+//! call — chunking/retry lives in the flush loop.
 
 use std::time::Duration;
 
-use crate::model::{AgentConfigResponse, StatsBatch};
+use crate::model::{AgentConfigResponse, HeartbeatBody, StatsBatch};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// A misbehaving control plane must not balloon agent memory.
@@ -23,7 +23,10 @@ pub enum FetchError {
     #[error("config response too large ({0} bytes > {1})")]
     TooLarge(usize, usize),
     #[error("config poll failed: {status} {body}")]
-    Status { status: reqwest::StatusCode, body: String },
+    Status {
+        status: reqwest::StatusCode,
+        body: String,
+    },
     #[error("config decode failed: {0}")]
     Decode(#[from] serde_json::Error),
 }
@@ -38,7 +41,10 @@ impl CpClient {
         Self {
             base_url: base_url.to_string(),
             token: token.to_string(),
-            http: reqwest::Client::builder().timeout(HTTP_TIMEOUT).build().expect("reqwest client"),
+            http: reqwest::Client::builder()
+                .timeout(HTTP_TIMEOUT)
+                .build()
+                .expect("reqwest client"),
         }
     }
 
@@ -46,7 +52,10 @@ impl CpClient {
     pub async fn fetch_config(&self, version: i64) -> Result<Fetched, FetchError> {
         let resp = self
             .http
-            .get(format!("{}/api/agent/config?version={version}", self.base_url))
+            .get(format!(
+                "{}/api/agent/config?version={version}",
+                self.base_url
+            ))
             .bearer_auth(&self.token)
             .send()
             .await?;
@@ -73,16 +82,11 @@ impl CpClient {
         Ok(Fetched::Changed(Box::new(parsed)))
     }
 
-    /// POST /api/agent/stats (one chunk; the first chunk of a flush carries
-    /// the health snapshot).
-    pub async fn upload_stats(
-        &self,
-        samples: &[crate::model::StatsSample],
-        health: Option<&[crate::model::ServiceHealthSample]>,
-    ) -> Result<(), String> {
+    /// POST /api/agent/stats — one chunk of traffic samples. Service health
+    /// rides the heartbeat channel instead.
+    pub async fn upload_stats(&self, samples: &[crate::model::StatsSample]) -> Result<(), String> {
         let body = StatsBatch {
             samples: samples.to_vec(),
-            health: health.map(|h| h.to_vec()),
         };
         let resp = self
             .http
@@ -98,6 +102,31 @@ impl CpClient {
             let text = resp.text().await.unwrap_or_default();
             let text: String = text.chars().take(512).collect();
             return Err(format!("stats upload failed: {status}: {text}"));
+        }
+        Ok(())
+    }
+
+    /// POST /api/agent/heartbeat — liveness + the full service-state snapshot
+    /// (poll mode / WS disabled; the healthy WS path carries the same payload
+    /// over the socket). Fire-and-forget by contract: the next beat retries.
+    pub async fn upload_heartbeat(
+        &self,
+        health: &[crate::model::ServiceHealthSample],
+    ) -> Result<(), String> {
+        let body = HeartbeatBody { health };
+        let resp = self
+            .http
+            .post(format!("{}/api/agent/heartbeat", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let text: String = text.chars().take(512).collect();
+            return Err(format!("heartbeat upload failed: {status}: {text}"));
         }
         Ok(())
     }
