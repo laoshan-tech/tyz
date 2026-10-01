@@ -14,7 +14,11 @@ use tyz_agent::runtime::{SharedSupervisor, Supervisor};
 const SNI: &str = "relay.example.test";
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn material(cert_pem: String, key_pem: String) -> TlsMaterial {
@@ -73,9 +77,10 @@ async fn spawn_echo() -> u16 {
 #[tokio::test]
 async fn tls_link_entry_to_exit() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            tracing_subscriber::EnvFilter::new("warn")
-        }))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .try_init();
     kaminari::install_tls_provider();
 
@@ -104,24 +109,45 @@ async fn tls_link_entry_to_exit() {
 
     let apply = |services: Vec<RealmService>, tls: Option<TlsMaterial>| async move {
         let stats = tyz_agent::stats::StatsRegistry::new();
-        let supervisor: SharedSupervisor = Arc::new(AsyncMutex::new(Supervisor::new(stats.clone())));
+        let supervisor: SharedSupervisor =
+            Arc::new(AsyncMutex::new(Supervisor::new(stats.clone())));
         let config = RealmNodeConfig {
-            node: NodeInfo { id: 1, name: "n".into() },
+            node: NodeInfo {
+                id: 1,
+                name: "n".into(),
+            },
             services,
             tls_material: tls,
         };
-        let outcome = supervisor.lock().await.apply_config(&config, false).await.expect("translate");
+        let outcome = supervisor
+            .lock()
+            .await
+            .apply_config(&config, false)
+            .await
+            .expect("translate");
         assert!(outcome.ok(), "apply failures: {:?}", outcome.failures);
         supervisor
     };
 
     let exit = apply(
-        vec![service("service-1", exit_port, "127.0.0.1", target_port, Some(TlsSide::Listen))],
+        vec![service(
+            "service-1",
+            exit_port,
+            "127.0.0.1",
+            target_port,
+            Some(TlsSide::Listen),
+        )],
         Some(material(cert_pem.clone(), key_pem.clone())),
     )
     .await;
     let entry = apply(
-        vec![service("service-1", entry_port, "127.0.0.1", exit_port, Some(TlsSide::Connect))],
+        vec![service(
+            "service-1",
+            entry_port,
+            "127.0.0.1",
+            exit_port,
+            Some(TlsSide::Connect),
+        )],
         Some(material(cert_pem.clone(), key_pem.clone())),
     )
     .await;
@@ -130,31 +156,49 @@ async fn tls_link_entry_to_exit() {
 
     // Forward through the TLS link: client → entry(plain) ⇒ TLS ⇒ exit → echo.
     const PAYLOAD: &[u8] = b"tyz-tls-e2e-probe-payload";
-    let mut sock = tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(("127.0.0.1", entry_port)))
-        .await
-        .expect("connect within timeout")
-        .expect("connect ok");
+    let mut sock = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", entry_port)),
+    )
+    .await
+    .expect("connect within timeout")
+    .expect("connect ok");
     sock.write_all(PAYLOAD).await.unwrap();
     let mut back = vec![0u8; PAYLOAD.len()];
-    tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut back))
-        .await
-        .expect("tls echo within timeout")
-        .expect("echo read ok");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sock.read_exact(&mut back),
+    )
+    .await
+    .expect("tls echo within timeout")
+    .expect("echo read ok");
     assert_eq!(back, PAYLOAD, "traffic must traverse the kaminari TLS link");
 
     // A plaintext probe straight at the TLS exit must NOT be echoed: the
     // handshake fails and the connection dies. The probe may see a short TLS
     // ALERT record (what any real TLS server answers to garbage) — the
     // invariant is: never the request echoed back, and the link settles fast.
-    let mut probe = TcpStream::connect(("127.0.0.1", exit_port)).await.expect("probe connect");
-    probe.write_all(b"GET /probe HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+    let mut probe = TcpStream::connect(("127.0.0.1", exit_port))
+        .await
+        .expect("probe connect");
+    probe
+        .write_all(b"GET /probe HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
     let mut buf = vec![0u8; 64];
     let seen = tokio::time::timeout(std::time::Duration::from_secs(3), probe.read(&mut buf))
         .await
         .expect("probe must settle (timeout would mean a hung handshake)")
         .unwrap_or(0);
-    assert!(seen <= 8, "no raw echo through the TLS exit (got {seen} bytes: {:?})", &buf[..seen]);
-    assert!(!buf[..seen].windows(4).any(|w| w == b"robe"), "the plaintext request must never come back");
+    assert!(
+        seen <= 8,
+        "no raw echo through the TLS exit (got {seen} bytes: {:?})",
+        &buf[..seen]
+    );
+    assert!(
+        !buf[..seen].windows(4).any(|w| w == b"robe"),
+        "the plaintext request must never come back"
+    );
 
     std::env::set_current_dir(prev).unwrap();
     let _ = std::fs::remove_dir_all(dir);

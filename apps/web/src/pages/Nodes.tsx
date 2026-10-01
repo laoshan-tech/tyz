@@ -17,6 +17,7 @@ import { type FormEvent, useMemo, useState } from "react";
 import { api } from "../api";
 import { confirmDanger } from "../confirm";
 import { formatTraffic } from "../format";
+import { NodeHealthChip, nodeHealthKind } from "../health";
 import { serviceStateLabel } from "../labels";
 import { nodesListOptions } from "../queries";
 import {
@@ -462,43 +463,22 @@ function StatsDrawer({ node, onClose }: { node: NodeWithMeta; onClose: () => voi
 
 type NodeHealthSummary = DashboardSummary["nodes_health"][number];
 
-type NodeHealthFilter = "all" | "ready" | "abnormal" | "unreported";
+type NodeHealthFilter = "all" | "ready" | "abnormal" | "offline" | "unreported";
 
 const NODE_HEALTH_FILTERS: { value: NodeHealthFilter; label: string }[] = [
   { value: "all", label: "全部" },
   { value: "ready", label: "正常" },
   { value: "abnormal", label: "异常" },
+  { value: "offline", label: "离线" },
   { value: "unreported", label: "未上报" },
 ];
 
-/** 健康筛选口径与 NodeHealthChip 一致：failed+apply_failed 计为异常，0 服务/缺行 = 未上报。 */
-function nodeHealthKind(health: NodeHealthSummary | undefined): Exclude<NodeHealthFilter, "all"> {
-  if (health === undefined || health.services === 0) return "unreported";
-  return health.failed > 0 ? "abnormal" : "ready";
-}
-
-/** 列表行健康 chip：口径与控制台健康墙一致（failed+apply_failed 计为异常，0 服务 = 未上报）。 */
-function NodeHealthChip({ health }: { health: NodeHealthSummary | undefined }) {
-  if (health === undefined) return <span className="text-muted">-</span>;
-  if (health.services === 0) {
-    return (
-      <StatusChip tone="default" title="agent 未上报健康快照">
-        未上报
-      </StatusChip>
-    );
-  }
-  if (health.failed > 0) {
-    return (
-      <StatusChip tone="danger" title={`${health.failed} 个服务失败/下发失败，点行尾「统计」查看详情`}>
-        {health.failed} 异常
-      </StatusChip>
-    );
-  }
-  return (
-    <StatusChip tone="success" title={`最近上报 ${health.last_report?.replace("T", " ").slice(0, 19) ?? "-"}`}>
-      {health.ready}/{health.services} 就绪
-    </StatusChip>
-  );
+/** 健康筛选口径与 NodeHealthChip 一致：ready+idle 归入「正常」（agent 在线且无失败），
+ * 离线单独一桶；failed/apply_failed 只在 online 时计为异常。 */
+function nodeHealthFilterKind(health: NodeHealthSummary | undefined): Exclude<NodeHealthFilter, "all"> {
+  const kind = nodeHealthKind(health);
+  if (kind === "idle") return "ready";
+  return kind;
 }
 
 // ---- Page ----
@@ -543,7 +523,7 @@ export default function NodesPage() {
     const all = nodesQuery.data?.nodes ?? [];
     const healthByNode = new Map(healthQuery.data?.nodes_health.map((h) => [h.node_id, h]));
     return all.filter((n) => {
-      if (healthFilter !== "all" && nodeHealthKind(healthByNode.get(n.id)) !== healthFilter) return false;
+      if (healthFilter !== "all" && nodeHealthFilterKind(healthByNode.get(n.id)) !== healthFilter) return false;
       if (!q) return true;
       return [String(n.id), n.name, n.address, n.display_address ?? ""].some((field) =>
         field.toLowerCase().includes(q),

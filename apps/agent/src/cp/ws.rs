@@ -1,8 +1,11 @@
 //! WebSocket push channel — the state machine mirrors the Go agent's
 //! (cp/ws.go) parameter-for-parameter:
 //!
-//! - keepalive is a TEXT message `"ping"` — the Durable Object auto-responds
-//!   `"pong"` at the edge via setWebSocketAutoResponse, matching text only;
+//! - the keepalive tick IS the heartbeat: every `heartbeat_interval` the
+//!   session sends `{"type":"heartbeat","health":[...]}` (the full service
+//!   snapshot) and the Durable Object answers `"pong"` — any inbound frame
+//!   feeds the read watchdog. The first beat fires immediately on connect so
+//!   liveness is stamped without waiting a full interval;
 //! - healthy WS ⇒ HTTP polling is a 5-minute safety net (the loop reads
 //!   `mode()` to pick its cadence);
 //! - every successful (re)connect emits `Connected` → the loop immediately
@@ -23,6 +26,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::model::PushMessage;
+use crate::runtime::SharedSupervisor;
 
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const FAILURE_THRESHOLD: usize = 3;
@@ -48,7 +52,13 @@ pub enum WsEvent {
 pub struct WsOpts {
     pub url: String,
     pub token: String,
-    pub ping_interval: Duration,
+    /// Health-snapshot provider for heartbeat payloads (the supervisor's last
+    /// desired world). Production passes the shared supervisor.
+    pub supervisor: SharedSupervisor,
+    /// Production uses agentcfg::HEARTBEAT_INTERVAL (60s, fixed); tests pass
+    /// a small duration. The read watchdog is 2× this — Cloudflare's edge
+    /// drops idle sockets at ~100s, and the DO's pong keeps inbound alive.
+    pub heartbeat_interval: Duration,
     pub probe_interval: Duration,
 }
 
@@ -96,9 +106,13 @@ async fn run(opts: WsOpts, events: mpsc::Sender<WsEvent>, ws_mode: std::sync::Ar
     loop {
         match connect_and_session(&opts, &events, &mut failures, &ws_mode).await {
             ConnectResult::BadUrl => {
+                // A URL that can't even parse never self-heals — log it and
+                // fall through to the demote logic so the channel ends up in
+                // poll mode instead of silently retrying at 1s in ws mode.
+                tracing::warn!(
+                    "ws push url is unusable — check CONTROL_PLANE_URL; using HTTP polling"
+                );
                 record_failure(&mut failures);
-                tokio::time::sleep(BACKOFF_MIN).await;
-                continue;
             }
             ConnectResult::Refused => {
                 record_failure(&mut failures);
@@ -115,11 +129,13 @@ async fn run(opts: WsOpts, events: mpsc::Sender<WsEvent>, ws_mode: std::sync::Ar
 
         let demoted = failures.len() >= FAILURE_THRESHOLD;
         let new_mode = if demoted { Mode::Poll } else { Mode::Ws };
-        let flipped = ws_mode.swap(matches!(new_mode, Mode::Ws), Ordering::Relaxed) != matches!(new_mode, Mode::Ws);
+        let flipped = ws_mode.swap(matches!(new_mode, Mode::Ws), Ordering::Relaxed)
+            != matches!(new_mode, Mode::Ws);
         if flipped {
             tracing::warn!(
                 reason = if demoted { "flapping" } else { "recovered" },
-                "config push channel mode change: {:?}", new_mode
+                "config push channel mode change: {:?}",
+                new_mode
             );
             let _ = events.send(WsEvent::ModeChanged(new_mode)).await;
         }
@@ -166,7 +182,9 @@ async fn connect_and_session(
     use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
     request.headers_mut().insert(
         AUTHORIZATION,
-        format!("Bearer {}", opts.token).parse().expect("header value"),
+        format!("Bearer {}", opts.token)
+            .parse()
+            .expect("header value"),
     );
 
     let (ws, _resp) = match tokio_tungstenite::connect_async(request).await {
@@ -201,7 +219,8 @@ async fn update_mode(
 ) {
     let demoted = failures.len() >= FAILURE_THRESHOLD;
     let new_mode = if demoted { Mode::Poll } else { Mode::Ws };
-    let flipped = ws_mode.swap(matches!(new_mode, Mode::Ws), Ordering::Relaxed) != matches!(new_mode, Mode::Ws);
+    let flipped = ws_mode.swap(matches!(new_mode, Mode::Ws), Ordering::Relaxed)
+        != matches!(new_mode, Mode::Ws);
     if flipped {
         tracing::warn!(
             reason = if demoted { "flapping" } else { "recovered" },
@@ -217,22 +236,26 @@ async fn session(
     opts: &WsOpts,
     events: &mpsc::Sender<WsEvent>,
 ) -> SessionOutcome {
-    // Read watchdog: the DO answers "ping" with "pong"; ANY inbound frame
-    // proves liveness. Silence beyond 2× the ping interval = dead link (the
-    // Cloudflare edge drops idle sockets at ~100s). The sleep is created
+    // Read watchdog: the DO answers a heartbeat with "pong"; ANY inbound frame
+    // proves liveness. Silence beyond 2× the heartbeat interval = dead link
+    // (the Cloudflare edge drops idle sockets at ~100s). The sleep is created
     // fresh inside the select each iteration — every received frame resets it.
-    let watchdog = opts.ping_interval.saturating_mul(2);
-    let mut ping_tick = tokio::time::interval(opts.ping_interval);
-    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping_tick.tick().await; // consume the immediate first tick
+    let watchdog = opts.heartbeat_interval.saturating_mul(2);
+    let mut beat_tick = tokio::time::interval(opts.heartbeat_interval);
+    beat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The interval's immediate first tick is NOT consumed: the first
+    // heartbeat goes out right after the handshake, stamping liveness without
+    // waiting a full interval.
 
     loop {
         tokio::select! {
             _ = tokio::time::sleep(watchdog) => {
                 return SessionOutcome::Failed;
             }
-            _ = ping_tick.tick() => {
-                if ws.send(Message::Text("ping".into())).await.is_err() {
+            _ = beat_tick.tick() => {
+                let health = opts.supervisor.lock().await.health_snapshot();
+                let message = serde_json::json!({ "type": "heartbeat", "health": health });
+                if ws.send(Message::Text(message.to_string())).await.is_err() {
                     return SessionOutcome::Failed;
                 }
             }
@@ -273,14 +296,39 @@ async fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tokio::net::TcpListener;
-    
 
-    /// Local echo-push WS server: answers "ping"→"pong", greets with a
-    /// config_changed, then forwards scripted pushes.
-    async fn spawn_ws_server(pushes: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> String {
+    use crate::runtime::Supervisor;
+    use crate::stats::StatsRegistry;
+
+    fn test_supervisor() -> SharedSupervisor {
+        Arc::new(tokio::sync::Mutex::new(Supervisor::new(
+            StatsRegistry::new(),
+        )))
+    }
+
+    fn test_opts(url: String, heartbeat_ms: u64, probe_ms: u64) -> WsOpts {
+        WsOpts {
+            url,
+            token: "t".into(),
+            supervisor: test_supervisor(),
+            heartbeat_interval: Duration::from_millis(heartbeat_ms),
+            probe_interval: Duration::from_millis(probe_ms),
+        }
+    }
+
+    /// Local echo-push WS server: answers heartbeat JSON (and legacy "ping")
+    /// with "pong", greets with a config_changed, then forwards scripted
+    /// pushes. Inbound heartbeat texts are recorded for assertions.
+    async fn spawn_ws_server(
+        pushes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let heartbeats: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let server_heartbeats = heartbeats.clone();
         tokio::spawn(async move {
             loop {
                 let (stream, _) = match listener.accept().await {
@@ -288,13 +336,16 @@ mod tests {
                     Err(_) => return,
                 };
                 let pushes = pushes.clone();
+                let heartbeats = server_heartbeats.clone();
                 tokio::spawn(async move {
                     let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
                         return;
                     };
-                    let _ = ws.send(Message::Text(r#"{"type":"config_changed"}"#.into())).await;
+                    let _ = ws
+                        .send(Message::Text(r#"{"type":"config_changed"}"#.into()))
+                        .await;
                     // scripted pushes go out right after the greeting (the
-                    // agent itself only ever sends "ping" texts)
+                    // agent itself only ever sends heartbeat texts)
                     loop {
                         let next = pushes.lock().unwrap().pop();
                         match next {
@@ -308,31 +359,29 @@ mod tests {
                         if let Message::Text(text) = msg {
                             if text == "ping" {
                                 let _ = ws.send(Message::Text("pong".into())).await;
+                            } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if v.get("type").and_then(|t| t.as_str()) == Some("heartbeat") {
+                                    heartbeats.lock().unwrap().push(text);
+                                    let _ = ws.send(Message::Text("pong".into())).await;
+                                }
                             }
                         }
                     }
                 });
             }
         });
-        format!("ws://{addr}/api/agent/ws")
+        (format!("ws://{addr}/api/agent/ws"), heartbeats)
     }
 
     #[tokio::test]
     async fn delivers_pushes_and_recovers_mode() {
-        let pushes: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::new(
-            std::sync::Mutex::new(vec![r#"{"type":"restart_service","service":"service-9"}"#.to_string()]),
-        );
-        let url = spawn_ws_server(pushes).await;
+        let pushes: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(vec![
+                r#"{"type":"restart_service","service":"service-9"}"#.to_string(),
+            ]));
+        let (url, heartbeats) = spawn_ws_server(pushes).await;
         let (tx, mut rx) = mpsc::channel(64);
-        let channel = WsChannel::spawn(
-            WsOpts {
-                url,
-                token: "t".into(),
-                ping_interval: Duration::from_millis(50),
-                probe_interval: Duration::from_millis(50),
-            },
-            tx,
-        );
+        let channel = WsChannel::spawn(test_opts(url, 50, 50), tx);
 
         let mut saw_connected = false;
         let mut saw_changed = false;
@@ -357,7 +406,52 @@ mod tests {
             }
         }
         assert!(saw_connected && saw_changed && saw_restart);
-        assert_eq!(channel.mode(), Mode::Ws, "a healthy link must stay in ws mode");
+        assert_eq!(
+            channel.mode(),
+            Mode::Ws,
+            "a healthy link must stay in ws mode"
+        );
+        // The keepalive tick IS the heartbeat: the first beat fires right
+        // after the handshake and the server's pong keeps the session alive.
+        // It races the push events above — wait for it on its own clock.
+        let hb_deadline = Instant::now() + Duration::from_secs(2);
+        while heartbeats.lock().unwrap().is_empty() && Instant::now() < hb_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !heartbeats.lock().unwrap().is_empty(),
+            "session must send heartbeat messages"
+        );
+        channel.stop().await;
+    }
+
+    #[tokio::test]
+    async fn unusable_url_demotes_to_poll() {
+        // A URL that can't parse never connects — it must demote the channel
+        // (visible in logs / poll cadence) instead of silently spinning in
+        // ws mode at 1s intervals.
+        let (tx, mut rx) = mpsc::channel(64);
+        let channel = WsChannel::spawn(test_opts(String::new(), 50, 50), tx);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut demoted = false;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(WsEvent::ModeChanged(mode))) => {
+                    assert_eq!(mode, Mode::Poll);
+                    demoted = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            demoted,
+            "unparseable url must demote the channel to poll mode"
+        );
+        assert_eq!(channel.mode(), Mode::Poll);
         channel.stop().await;
     }
 
@@ -370,15 +464,7 @@ mod tests {
         let url = format!("ws://{addr}/x");
 
         let (tx, mut rx) = mpsc::channel(64);
-        let channel = WsChannel::spawn(
-            WsOpts {
-                url,
-                token: "t".into(),
-                ping_interval: Duration::from_millis(50),
-                probe_interval: Duration::from_millis(80),
-            },
-            tx,
-        );
+        let channel = WsChannel::spawn(test_opts(url, 50, 80), tx);
 
         // 3 failures within the window → demotion event.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -414,11 +500,17 @@ mod tests {
                     let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
                         return;
                     };
-                    let _ = ws.send(Message::Text(r#"{"type":"config_changed"}"#.into())).await;
+                    let _ = ws
+                        .send(Message::Text(r#"{"type":"config_changed"}"#.into()))
+                        .await;
                     while let Some(Ok(msg)) = ws.next().await {
                         if let Message::Text(t) = msg {
                             if t == "ping" {
                                 let _ = ws.send(Message::Text("pong".into())).await;
+                            } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                                if v.get("type").and_then(|ty| ty.as_str()) == Some("heartbeat") {
+                                    let _ = ws.send(Message::Text("pong".into())).await;
+                                }
                             }
                         }
                     }

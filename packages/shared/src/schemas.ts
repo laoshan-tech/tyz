@@ -193,8 +193,9 @@ const gostStatsSampleSchema = z.object({
   totalErrs: z.number().int().nonnegative(),
 });
 
-// The agent additionally reports the runtime state of every managed GOST
-// service with each stats flush (x/service.State: running|ready|failed|closed).
+// Service runtime state rides the heartbeat channel (WS heartbeat message or
+// POST /api/agent/heartbeat), NOT the stats batch — liveness and the service
+// snapshot share one cadence, traffic stays event-driven.
 
 const serviceHealthSampleSchema = z.object({
   service: z.string().max(256),
@@ -205,24 +206,32 @@ const serviceHealthSampleSchema = z.object({
 export const agentStatsBatchSchema = z
   .object({
     // The agent marshals nil Go slices as JSON null — accept null alongside
-    // absent (zod's .default only covers absence) and normalize to [].
-    // Array caps bound ingest cost; both sit above anything the agent can emit
-    // (its stats buffer is capped at 1000; health is one row per service).
+    // absent (zod's .default only covers absence) and normalize to []. The cap
+    // bounds ingest cost: the agent's stats buffer holds at most 1000 samples.
     samples: z
       .array(gostStatsSampleSchema)
       .max(1000)
       .nullish()
       .transform((v) => v ?? []),
-    health: z
-      .array(serviceHealthSampleSchema)
-      .max(500)
-      .nullish()
-      .transform((v) => v ?? []),
   })
-  .refine((v) => v.samples.length > 0 || v.health.length > 0, {
-    message: "batch must carry samples or health",
+  .refine((v) => v.samples.length > 0, {
+    message: "batch must carry samples",
   });
+
+// Heartbeat payload: the full service-state snapshot, possibly empty (a node
+// with zero deployed services still heartbeats — the empty snapshot is what
+// clears stale service_health rows server-side). WS messages wrap this with a
+// "type":"heartbeat" tag; zod strips the unknown key, so one schema serves
+// both the WS path and POST /api/agent/heartbeat.
+export const agentHeartbeatSchema = z.object({
+  health: z
+    .array(serviceHealthSampleSchema)
+    .max(500)
+    .nullish()
+    .transform((v) => v ?? []),
+});
 
 export type GostStatsSample = z.infer<typeof gostStatsSampleSchema>;
 export type ServiceHealthSample = z.infer<typeof serviceHealthSampleSchema>;
 export type AgentStatsBatch = z.infer<typeof agentStatsBatchSchema>;
+export type AgentHeartbeat = z.infer<typeof agentHeartbeatSchema>;

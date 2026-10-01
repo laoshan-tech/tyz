@@ -1,4 +1,7 @@
+import { agentHeartbeatSchema } from "@tyz/shared";
+import { createDb } from "../db";
 import type { Bindings } from "../env";
+import { ingestHealthSnapshot } from "../services/health";
 
 /**
  * Per-node Durable Object holding the agent WebSocket connections for one node.
@@ -15,17 +18,25 @@ import type { Bindings } from "../env";
  *                                 the agent rebuilds that one service from its
  *                                 last applied config (dropping live connections)
  * Protocol (agent -> server):
- *   "ping"  ->  "pong"            keepalive, answered by the runtime at the edge
- *                                 via setWebSocketAutoResponse — the hibernated DO
- *                                 is never woken for heartbeats
+ *   {"type":"heartbeat","health":[...]}
+ *                                 the periodic liveness beat — the DO stamps the
+ *                                 node's sentinel row and folds the snapshot into
+ *                                 service_health, then answers "pong" (any inbound
+ *                                 frame feeds the agent's read watchdog). Waking
+ *                                 the DO once a minute per node is the accepted
+ *                                 cost of carrying the heartbeat over the socket.
+ *   "ping"  ->  "pong"            legacy keepalive, still answered by the runtime
+ *                                 at the edge via setWebSocketAutoResponse so a
+ *                                 not-yet-upgraded agent never flap-loops.
  */
 export class NodePushDO implements DurableObject {
   constructor(
     private readonly state: DurableObjectState,
-    _env: Bindings,
+    private readonly env: Bindings,
   ) {
-    // Answer "ping" with "pong" without waking this object: zero duration cost
-    // for heartbeats, and outbound messages are not billed as requests.
+    // Legacy-agent tolerance: a pre-heartbeat agent keeps its link alive with
+    // text "ping"; the edge answers without waking this object. Upgraded
+    // agents never send it (they send heartbeat messages, handled below).
     this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
@@ -63,9 +74,39 @@ export class NodePushDO implements DurableObject {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
-  // No webSocketMessage handler: "ping" is auto-responded by the runtime (see
-  // constructor) and the agent sends nothing else today, so there is nothing to
-  // do on incoming messages.
+  /**
+   * Heartbeat over the push socket: pong FIRST (the agent's watchdog only
+   * needs a frame — ingest latency or failure must never starve it), then
+   * stamp liveness + fold the service snapshot. D1 failures are logged and
+   * self-heal on the next beat; the socket stays up either way.
+   */
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (typeof message !== "string") return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(message);
+    } catch {
+      return;
+    }
+    try {
+      ws.send("pong");
+    } catch {
+      // socket died mid-beat; the reconnect restamps liveness
+    }
+    if (!parsed || typeof parsed !== "object" || (parsed as { type?: unknown }).type !== "heartbeat") return;
+
+    const beat = agentHeartbeatSchema.safeParse(parsed);
+    if (!beat.success) {
+      console.error("invalid heartbeat message", beat.error.flatten());
+      return;
+    }
+    // The DO is addressed idFromName(String(nodeId)) — the name IS the node id.
+    const nodeId = Number(this.state.id.name);
+    const reportedAt = new Date().toISOString();
+    await ingestHealthSnapshot(createDb(this.env.DB), nodeId, beat.data.health, reportedAt).catch((err) =>
+      console.error("heartbeat ingest failed", err),
+    );
+  }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     try {

@@ -339,14 +339,17 @@ export interface DashboardSummary {
   nodes_health: {
     node_id: number;
     name: string;
-    /** Services present in the node's latest health snapshot (0 = agent idle/offline). */
+    /** Services present in the node's latest health snapshot (0 = nothing deployed). */
     services: number;
     ready: number;
-    /** failed + apply_failed states. */
+    /** failed + apply_failed states — meaningful only while online. */
     failed: number;
     /** Max concurrent connections across the node's services over the last 24h. */
     conn_peak_24h: number;
+    /** Latest report timestamp (heartbeat sentinel or service row), ISO. */
     last_report: string | null;
+    /** Server-clock liveness: last_report is within the offline threshold. */
+    online: boolean;
   }[];
   traffic: {
     today: { upload: number; download: number };

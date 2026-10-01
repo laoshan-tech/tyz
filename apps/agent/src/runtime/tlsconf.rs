@@ -18,7 +18,10 @@ pub fn server_acceptor() -> Result<MixAccept, String> {
         crate::certs::server_key_path()
     );
     let tls = opt::get_tls_server_conf(&opts).ok_or("kaminari rejected the tls server conf")?;
-    Ok(MixAccept::new_shared(MixServerConf { ws: None, tls: Some(tls) }))
+    Ok(MixAccept::new_shared(MixServerConf {
+        ws: None,
+        tls: Some(tls),
+    }))
 }
 
 /// Entry leg: dial with SNI = platform domain. kaminari's client has no
@@ -32,5 +35,8 @@ pub fn client_connector(material: &TlsMaterial, alpn: &[String]) -> MixConnect {
         insecure: true,
         early_data: false,
     };
-    MixConnect::new_shared(MixClientConf { ws: None, tls: Some(tls) })
+    MixConnect::new_shared(MixClientConf {
+        ws: None,
+        tls: Some(tls),
+    })
 }

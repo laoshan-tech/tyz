@@ -21,7 +21,11 @@ fn cache_path() -> PathBuf {
 
 /// Path-injected variants (tests run in parallel temp dirs).
 pub fn save_at(path: &Path, resp: &AgentConfigResponse) {
-    if let Err(err) = atomic_write(path, toml::to_string_pretty(resp).expect("serialize").as_bytes(), 0o600) {
+    if let Err(err) = atomic_write(
+        path,
+        toml::to_string_pretty(resp).expect("serialize").as_bytes(),
+        0o600,
+    ) {
         panic!("test helper write failed: {err}");
     }
 }
@@ -87,7 +91,10 @@ mod tests {
         AgentConfigResponse {
             version,
             config: RealmNodeConfig {
-                node: NodeInfo { id: 7, name: "n7".into() },
+                node: NodeInfo {
+                    id: 7,
+                    name: "n7".into(),
+                },
                 services: vec![],
                 tls_material: None,
             },
@@ -96,7 +103,14 @@ mod tests {
 
     #[test]
     fn roundtrip_in_tempdir() {
-        let dir = std::env::temp_dir().join(format!("tyz-agent-store-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "tyz-agent-store-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let cache = dir.join(CACHE_FILE);
         save_at(&cache, &resp(42));

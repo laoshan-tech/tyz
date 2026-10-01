@@ -14,7 +14,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{TlsMaterial, TlsSide};
-use crate::runtime::net::{tls_accept, ClientConn, ConnContext, handle_conn};
+use crate::runtime::net::{handle_conn, tls_accept, ClientConn, ConnContext};
 use crate::runtime::tlsconf;
 use crate::stats::StatsRegistry;
 use crate::translate::DesiredService;
@@ -98,12 +98,15 @@ impl ServiceHandle {
         // TLS assembly happens at construction (handshake-time material):
         // exits serve the platform cert, entries get a client connector.
         let acceptor: Option<MixAccept> = match desired.tls {
-            Some(TlsSide::Listen) => Some(tlsconf::server_acceptor().map_err(std::io::Error::other)?),
+            Some(TlsSide::Listen) => {
+                Some(tlsconf::server_acceptor().map_err(std::io::Error::other)?)
+            }
             _ => None,
         };
         let connector = match desired.tls {
             Some(TlsSide::Connect) => {
-                let m = material.ok_or_else(|| std::io::Error::other("tls connect leg without material"))?;
+                let m = material
+                    .ok_or_else(|| std::io::Error::other("tls connect leg without material"))?;
                 Some(Arc::new(tlsconf::client_connector(m, &desired.raw.alpn)))
             }
             _ => None,
@@ -161,7 +164,11 @@ impl ServiceHandle {
         if drop_conns {
             let n = self.conns.abort_all();
             if n > 0 {
-                tracing::info!(service = self.desired.raw.name, dropped = n, "forced connection drop");
+                tracing::info!(
+                    service = self.desired.raw.name,
+                    dropped = n,
+                    "forced connection drop"
+                );
             }
         }
         let _ = self.task.await;
@@ -169,7 +176,11 @@ impl ServiceHandle {
 
     /// Manual restart directive: close the listener, drop live connections,
     /// rebuild from the last desired config (no re-fetch).
-    pub async fn restart(self, material: Option<&TlsMaterial>, stats: Arc<StatsRegistry>) -> std::io::Result<ServiceHandle> {
+    pub async fn restart(
+        self,
+        material: Option<&TlsMaterial>,
+        stats: Arc<StatsRegistry>,
+    ) -> std::io::Result<ServiceHandle> {
         let desired = (*self.desired).clone();
         self.stop(true).await;
         ServiceHandle::spawn(desired, material, stats)

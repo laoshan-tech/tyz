@@ -103,7 +103,7 @@ pub struct TlsMaterial {
 /// a process lifetime (a restart re-anchors server-side, see traffic.ts).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GostStatsSample {
+pub struct StatsSample {
     pub service: String,
     /// Empty string = service-level sample (the ONLY kind the billing ledger
     /// consumes); a client IP = per-client breakdown row.
@@ -126,13 +126,20 @@ pub struct ServiceHealthSample {
     pub error: String,
 }
 
-/// Request body of POST /api/agent/stats. Empty vecs serialize as `[]` (never
-/// `null` — the zod schema tolerates null, but [] is what we promise).
+/// Request body of POST /api/agent/stats — traffic samples only. Service
+/// health moved to the heartbeat channel (see HeartbeatBody).
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsBatch {
-    pub samples: Vec<GostStatsSample>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub health: Option<Vec<ServiceHealthSample>>,
+    pub samples: Vec<StatsSample>,
+}
+
+/// Request body of POST /api/agent/heartbeat (and, wrapped with a
+/// `"type":"heartbeat"` tag, the WS heartbeat message): the full service-state
+/// snapshot. An empty vec is meaningful — it clears the node's stale
+/// service_health rows server-side.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeartbeatBody<'a> {
+    pub health: &'a [ServiceHealthSample],
 }
 
 // ---- GET /api/agent/ws (downstream push messages) ----

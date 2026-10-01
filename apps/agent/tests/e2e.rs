@@ -49,7 +49,10 @@ fn service(name: &str, listen: u16, host: &str, port: u16) -> RealmService {
 
 fn config(node_id: i64, services: Vec<RealmService>) -> RealmNodeConfig {
     RealmNodeConfig {
-        node: NodeInfo { id: node_id, name: format!("node-{node_id}") },
+        node: NodeInfo {
+            id: node_id,
+            name: format!("node-{node_id}"),
+        },
         services,
         tls_material: None,
     }
@@ -88,6 +91,7 @@ struct CpState {
     exit_config: Mutex<Vec<RealmService>>,
     version: Mutex<i64>,
     uploads: Mutex<Vec<serde_json::Value>>,
+    heartbeats: Mutex<Vec<(String, serde_json::Value)>>, // (token, body)
 }
 
 /// Mock control plane: token-routed config endpoint + stats recorder.
@@ -115,7 +119,10 @@ async fn spawn_cp(state: Arc<CpState>) -> String {
     format!("http://{addr}")
 }
 
-async fn handle(req: Request<Incoming>, state: Arc<CpState>) -> Result<Response<Full<tokio_util::bytes::Bytes>>, std::convert::Infallible> {
+async fn handle(
+    req: Request<Incoming>,
+    state: Arc<CpState>,
+) -> Result<Response<Full<tokio_util::bytes::Bytes>>, std::convert::Infallible> {
     let token = req
         .headers()
         .get(hyper::header::AUTHORIZATION)
@@ -134,7 +141,10 @@ async fn handle(req: Request<Incoming>, state: Arc<CpState>) -> Result<Response<
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         if asked >= current {
-            return Ok(Response::builder().status(StatusCode::NOT_MODIFIED).body(Full::default()).unwrap());
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .body(Full::default())
+                .unwrap());
         }
         let services = match token.as_str() {
             EXIT_TOKEN => state.exit_config.lock().unwrap().clone(),
@@ -152,22 +162,38 @@ async fn handle(req: Request<Incoming>, state: Arc<CpState>) -> Result<Response<
         return Ok(Response::new(Full::new(r#"{"ok":true}"#.into())));
     }
 
-    Ok(Response::builder().status(StatusCode::NOT_FOUND).body(Full::default()).unwrap())
+    if req.method() == "POST" && path == "/api/agent/heartbeat" {
+        let body = req.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        state.heartbeats.lock().unwrap().push((token, parsed));
+        return Ok(Response::new(Full::new(r#"{"ok":true}"#.into())));
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Full::default())
+        .unwrap())
 }
 
 async fn forward_roundtrip(port: u16, payload: &[u8]) -> Vec<u8> {
-    let mut sock = tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(("127.0.0.1", port)))
-        .await
-        .expect("connect within timeout")
-        .expect("connect ok");
+    let mut sock = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .expect("connect within timeout")
+    .expect("connect ok");
     sock.write_all(payload).await.unwrap();
     // brutal-shutdown (realm's default) cuts the relay when the client
     // half-closes — read the response BEFORE closing the write side.
     let mut back = vec![0u8; payload.len()];
-    tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut back))
-        .await
-        .expect("echo within timeout")
-        .expect("echo read ok");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sock.read_exact(&mut back),
+    )
+    .await
+    .expect("echo within timeout")
+    .expect("echo read ok");
     back
 }
 
@@ -190,11 +216,14 @@ async fn drive_apply(node: &Node, expected_services: usize) {
         .await
         .expect("translate");
     assert!(outcome.ok(), "no apply failures: {:?}", outcome.failures);
-    assert_eq!(node.supervisor.lock().await.service_count(), expected_services);
+    assert_eq!(
+        node.supervisor.lock().await.service_count(),
+        expected_services
+    );
 }
 
 fn flusher(node: &Node, cp: Arc<CpClient>) -> Flush {
-    Flush::new(cp, node.supervisor.clone(), node.stats.clone(), std::time::Duration::from_secs(60))
+    Flush::new(cp, node.stats.clone(), std::time::Duration::from_secs(60))
 }
 
 /// Silence tracing in tests unless RUST_LOG is set (keeps failures readable).
@@ -217,18 +246,34 @@ async fn two_node_forwarding_config_sync_and_stats() {
     let exit_port = free_port();
 
     let state = Arc::new(CpState {
-        entry_config: Mutex::new(vec![service("service-1", entry_port, "127.0.0.1", exit_port)]),
-        exit_config: Mutex::new(vec![service("service-1", exit_port, "127.0.0.1", target_port)]),
+        entry_config: Mutex::new(vec![service(
+            "service-1",
+            entry_port,
+            "127.0.0.1",
+            exit_port,
+        )]),
+        exit_config: Mutex::new(vec![service(
+            "service-1",
+            exit_port,
+            "127.0.0.1",
+            target_port,
+        )]),
         version: Mutex::new(1),
         uploads: Mutex::new(vec![]),
+        heartbeats: Mutex::new(vec![]),
     });
     let base = spawn_cp(state.clone()).await;
 
     let make_node = |token: &str| {
         let stats = tyz_agent::stats::StatsRegistry::new();
-        let supervisor: SharedSupervisor = Arc::new(AsyncMutex::new(Supervisor::new(stats.clone())));
+        let supervisor: SharedSupervisor =
+            Arc::new(AsyncMutex::new(Supervisor::new(stats.clone())));
         let cp = Arc::new(CpClient::new(&base, token));
-        Node { supervisor, cp, stats }
+        Node {
+            supervisor,
+            cp,
+            stats,
+        }
     };
     let entry = make_node(ENTRY_TOKEN);
     let exit = make_node(EXIT_TOKEN);
@@ -242,51 +287,72 @@ async fn two_node_forwarding_config_sync_and_stats() {
     let back = forward_roundtrip(entry_port, PAYLOAD).await;
     assert_eq!(back, PAYLOAD);
 
-    // 3. stats flush: both legs report service-1, service-level rows present
-    flusher(&entry, entry.cp.clone()).flush().await.expect("entry flush");
-    flusher(&exit, exit.cp.clone()).flush().await.expect("exit flush");
+    // 3. stats flush (traffic samples ONLY — health moved to the heartbeat):
+    // both legs report service-1, service-level rows present
+    flusher(&entry, entry.cp.clone())
+        .flush()
+        .await
+        .expect("entry flush");
+    flusher(&exit, exit.cp.clone())
+        .flush()
+        .await
+        .expect("exit flush");
 
     let uploads = state.uploads.lock().unwrap().clone();
     assert!(uploads.len() >= 2, "both nodes flushed: {}", uploads.len());
-    // Chunks after the first carry samples only (health rides the first
-    // request of each flush) — assert per flush, not per request.
     let mut saw_service_level = 0;
-    let mut saw_running_health = 0;
     for upload in &uploads {
+        assert!(
+            upload.get("health").is_none(),
+            "stats batches must not carry a health snapshot anymore"
+        );
         if let Some(samples) = upload["samples"].as_array() {
-            if let Some(svc) = samples
-                .iter()
-                .find(|s| s["service"] == "service-1" && s["client"].as_str().unwrap_or("").is_empty())
-            {
+            if let Some(svc) = samples.iter().find(|s| {
+                s["service"] == "service-1" && s["client"].as_str().unwrap_or("").is_empty()
+            }) {
                 assert!(svc["totalConns"].as_u64().unwrap() >= 1);
                 assert!(svc["inputBytes"].as_u64().unwrap() >= PAYLOAD.len() as u64);
                 assert!(svc["outputBytes"].as_u64().unwrap() >= PAYLOAD.len() as u64);
                 saw_service_level += 1;
             }
         }
-        if let Some(health) = upload["health"].as_array() {
-            if health.iter().any(|h| h["service"] == "service-1" && h["state"] == "running") {
-                saw_running_health += 1;
-            }
-        }
     }
     assert_eq!(saw_service_level, 2, "entry and exit both report service-1");
-    assert_eq!(saw_running_health, 2, "both nodes' health snapshots show service-1 running");
 
-    // 4. 304 fast path once the version is adopted
+    // 4. heartbeat: liveness + the full service snapshot on a separate channel
+    for node in [&entry, &exit] {
+        let health = node.supervisor.lock().await.health_snapshot();
+        node.cp.upload_heartbeat(&health).await.expect("heartbeat");
+    }
+    let heartbeats = state.heartbeats.lock().unwrap().clone();
+    assert_eq!(heartbeats.len(), 2, "both nodes heartbeated");
+    for (token, body) in &heartbeats {
+        let health = body["health"]
+            .as_array()
+            .expect("heartbeat carries health array");
+        assert!(
+            health
+                .iter()
+                .any(|h| h["service"] == "service-1" && h["state"] == "running"),
+            "heartbeat of {token} shows service-1 running"
+        );
+    }
+
+    // 5. 304 fast path once the version is adopted
     for node in [&entry, &exit] {
         let fetched = node.cp.fetch_config(1).await.expect("fetch");
         assert!(matches!(fetched, Fetched::NotModified));
     }
 
-    // 5. manual restart directive: connections drop, service rebuilds
+    // 6. manual restart directive: connections drop, service rebuilds
     entry.supervisor.lock().await.restart("service-1").await;
     let back = forward_roundtrip(entry_port, PAYLOAD).await;
     assert_eq!(back, PAYLOAD, "service must serve again after restart");
 
-    // 6. target hot-swap: new config version points the EXIT at a new echo
+    // 7. target hot-swap: new config version points the EXIT at a new echo
     let target2 = spawn_echo().await;
-    *state.exit_config.lock().unwrap() = vec![service("service-1", exit_port, "127.0.0.1", target2)];
+    *state.exit_config.lock().unwrap() =
+        vec![service("service-1", exit_port, "127.0.0.1", target2)];
     *state.version.lock().unwrap() = 2;
     drive_apply(&exit, 1).await;
     let back = forward_roundtrip(entry_port, PAYLOAD).await;

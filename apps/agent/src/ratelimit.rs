@@ -44,7 +44,10 @@ impl RateLimiter {
             rate: bytes_per_sec,
             chunk,
             burst,
-            state: Mutex::new(LimiterState { tokens: burst, last: Instant::now() }),
+            state: Mutex::new(LimiterState {
+                tokens: burst,
+                last: Instant::now(),
+            }),
         })
     }
 
@@ -52,7 +55,10 @@ impl RateLimiter {
         let ms = now.duration_since(st.last).as_millis() as u64;
         if ms > 0 {
             st.last = now;
-            st.tokens = st.tokens.saturating_add(ms.saturating_mul(self.rate) / 1000).min(self.burst);
+            st.tokens = st
+                .tokens
+                .saturating_add(ms.saturating_mul(self.rate) / 1000)
+                .min(self.burst);
         }
     }
 
@@ -170,7 +176,11 @@ pub struct Paced<S> {
 
 impl<S> Paced<S> {
     pub fn new(inner: S, pacer: Pacer) -> Self {
-        Self { inner, pacer, waiter: Waiter::default() }
+        Self {
+            inner,
+            pacer,
+            waiter: Waiter::default(),
+        }
     }
 }
 
@@ -185,7 +195,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Paced<S> {
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for Paced<S> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         if self.pacer.is_empty() {
             return Pin::new(&mut self.inner).poll_write(cx, buf);
         }
@@ -268,7 +282,9 @@ mod tests {
         let n = write.await.unwrap();
         assert_eq!(n, 5_000, "capped to the granted allowance");
         let mut got = vec![0u8; 5_000];
-        tokio::io::AsyncReadExt::read_exact(&mut server, &mut got).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut got)
+            .await
+            .unwrap();
         assert_eq!(got, payload[..5_000]);
     }
 }
