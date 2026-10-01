@@ -255,7 +255,7 @@ async fn session(
             _ = beat_tick.tick() => {
                 let health = opts.supervisor.lock().await.health_snapshot();
                 let message = serde_json::json!({ "type": "heartbeat", "health": health });
-                if ws.send(Message::Text(message.to_string().into())).await.is_err() {
+                if ws.send(Message::Text(message.to_string())).await.is_err() {
                     return SessionOutcome::Failed;
                 }
             }
