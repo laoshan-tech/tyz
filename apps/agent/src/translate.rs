@@ -15,7 +15,11 @@ use crate::model::{BalanceStrategy, RealmNodeConfig, RealmService, TlsMaterial, 
 #[derive(Debug, thiserror::Error)]
 pub enum TranslateError {
     #[error("service {name:?}: invalid listen address {host}:{port}")]
-    BadListen { name: String, host: String, port: u16 },
+    BadListen {
+        name: String,
+        host: String,
+        port: u16,
+    },
     #[error("service {name:?}: empty target host")]
     EmptyTarget { name: String },
     #[error("service {name:?}: tls_side set but the payload carries no tls_material")]
@@ -103,14 +107,20 @@ pub fn translate(config: &RealmNodeConfig) -> Result<Vec<DesiredService>, Transl
             });
         }
         if targets.iter().any(|t| t.host.is_empty()) {
-            return Err(TranslateError::EmptyTarget { name: svc.name.clone() });
+            return Err(TranslateError::EmptyTarget {
+                name: svc.name.clone(),
+            });
         }
         if targets.len() < 2 && svc.balance.is_some() {
-            return Err(TranslateError::BadLbShape { name: svc.name.clone() });
+            return Err(TranslateError::BadLbShape {
+                name: svc.name.clone(),
+            });
         }
 
         if svc.tls_side.is_some() && material.is_none() {
-            return Err(TranslateError::TlsWithoutMaterial { name: svc.name.clone() });
+            return Err(TranslateError::TlsWithoutMaterial {
+                name: svc.name.clone(),
+            });
         }
 
         let balancer = match (svc.balance, targets.len() > 1) {
@@ -132,7 +142,11 @@ pub fn translate(config: &RealmNodeConfig) -> Result<Vec<DesiredService>, Transl
                 conn_in: l.conn_in,
                 conn_out: l.conn_out,
             };
-            if limiters.is_empty() { None } else { Some(Arc::new(limiters)) }
+            if limiters.is_empty() {
+                None
+            } else {
+                Some(Arc::new(limiters))
+            }
         });
 
         out.push(DesiredService {
@@ -173,7 +187,10 @@ mod tests {
 
     fn config(services: Vec<RealmService>, material: bool) -> RealmNodeConfig {
         RealmNodeConfig {
-            node: NodeInfo { id: 1, name: "n".into() },
+            node: NodeInfo {
+                id: 1,
+                name: "n".into(),
+            },
             services,
             tls_material: material.then(|| TlsMaterial {
                 sni: "relay.example.test".into(),
@@ -245,7 +262,10 @@ mod tests {
     fn lb_builds_balancer_with_equal_weights() {
         let mut svc = base_service("service-1");
         svc.balance = Some(BalanceStrategy::Iphash);
-        svc.extra_targets = vec![RealmTarget { host: "10.0.0.3".into(), port: 26500 }];
+        svc.extra_targets = vec![RealmTarget {
+            host: "10.0.0.3".into(),
+            port: 26500,
+        }];
         let out = translate(&config(vec![svc], false)).unwrap();
         assert!(out[0].balancer.is_some());
         assert_eq!(out[0].targets.len(), 2);

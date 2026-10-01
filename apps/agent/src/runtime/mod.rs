@@ -84,8 +84,10 @@ impl Supervisor {
             l
         };
 
-        let mut desired_map: HashMap<String, DesiredService> =
-            desired.into_iter().map(|d| (d.raw.name.clone(), d)).collect();
+        let mut desired_map: HashMap<String, DesiredService> = desired
+            .into_iter()
+            .map(|d| (d.raw.name.clone(), d))
+            .collect();
 
         // Stop removed services (keep their connections — the quota hard-stop
         // blocks new connections, it never kills established ones).
@@ -160,7 +162,8 @@ impl Supervisor {
                         }
                     }
                 }
-                None => match ServiceHandle::spawn(svc, self.material.as_ref(), self.stats.clone()) {
+                None => match ServiceHandle::spawn(svc, self.material.as_ref(), self.stats.clone())
+                {
                     Ok(handle) => {
                         self.running.insert(name, handle);
                         outcome.created += 1;
@@ -180,7 +183,10 @@ impl Supervisor {
     /// config, dropping its live connections. Unknown names no-op.
     pub async fn restart(&mut self, name: &str) -> bool {
         if let Some(old) = self.running.remove(name) {
-            match old.restart(self.material.as_ref(), self.stats.clone()).await {
+            match old
+                .restart(self.material.as_ref(), self.stats.clone())
+                .await
+            {
                 Ok(handle) => {
                     self.running.insert(name.to_string(), handle);
                     self.failures.retain(|(n, _)| n != name);
@@ -206,7 +212,10 @@ impl Supervisor {
                 }
             }
         } else {
-            tracing::warn!(service = name, "restart directive for unknown service (no-op)");
+            tracing::warn!(
+                service = name,
+                "restart directive for unknown service (no-op)"
+            );
             false
         }
     }
@@ -300,7 +309,10 @@ mod tests {
 
     fn config(port: u16, target: u16) -> RealmNodeConfig {
         RealmNodeConfig {
-            node: NodeInfo { id: 1, name: "n".into() },
+            node: NodeInfo {
+                id: 1,
+                name: "n".into(),
+            },
             services: vec![RealmService {
                 name: "service-1".into(),
                 listen_host: "127.0.0.1".into(),
@@ -345,7 +357,9 @@ mod tests {
         assert_eq!(again.updated, 0);
         assert_eq!(sv.service_count(), 1);
 
-        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         roundtrip(&mut client, b"still-serving").await;
     }
 
@@ -356,17 +370,24 @@ mod tests {
         let target = echo_server().await;
         let port = free_port().await;
         let mut cfg = config(port, target);
-        cfg.services[0].limit = Some(ServiceLimit { max_conns: Some(1), ..Default::default() });
+        cfg.services[0].limit = Some(ServiceLimit {
+            max_conns: Some(1),
+            ..Default::default()
+        });
         let mut sv = Supervisor::new(StatsRegistry::new());
 
         let first = sv.apply_config(&cfg, false).await.unwrap();
         assert!(first.ok());
 
-        let mut client1 = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut client1 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         roundtrip(&mut client1, b"one").await;
 
         // The second connection is accepted at TCP level, then closed at once.
-        let mut client2 = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut client2 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         let mut buf = [0u8; 4];
         let n = tokio::time::timeout(Duration::from_secs(2), client2.read(&mut buf))
             .await
@@ -388,12 +409,17 @@ mod tests {
         let first = sv.apply_config(&cfg, false).await.unwrap();
         assert_eq!(first.created, 1);
 
-        let mut client1 = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut client1 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         roundtrip(&mut client1, b"before-heal").await;
 
         // Kill the accept loop the way a fatal accept error does: task exits,
         // listener socket closes, established tasks keep running.
-        sv.running.get_mut("service-1").unwrap().kill_accept_loop_for_test();
+        sv.running
+            .get_mut("service-1")
+            .unwrap()
+            .kill_accept_loop_for_test();
         tokio::time::timeout(Duration::from_secs(2), async {
             while !sv.running.get("service-1").unwrap().is_dead() {
                 tokio::task::yield_now().await;
@@ -412,7 +438,9 @@ mod tests {
         assert!(!sv.running.get("service-1").unwrap().is_dead());
 
         // The listener accepts again; the pre-heal connection still works.
-        let mut client2 = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut client2 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         roundtrip(&mut client2, b"after-heal").await;
         roundtrip(&mut client1, b"after-heal-old-conn").await;
     }

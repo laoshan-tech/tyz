@@ -43,11 +43,26 @@ pub fn ensure_in(base: &Path, material: &TlsMaterial) -> io::Result<Certs> {
     }
 
     let pems = [
-        NamedPem { file: "ca.pem", content: &material.ca_cert },
-        NamedPem { file: "server.pem", content: &material.server_cert },
-        NamedPem { file: "server_key.pem", content: &material.server_key },
-        NamedPem { file: "client.pem", content: &material.client_cert },
-        NamedPem { file: "client_key.pem", content: &material.client_key },
+        NamedPem {
+            file: "ca.pem",
+            content: &material.ca_cert,
+        },
+        NamedPem {
+            file: "server.pem",
+            content: &material.server_cert,
+        },
+        NamedPem {
+            file: "server_key.pem",
+            content: &material.server_key,
+        },
+        NamedPem {
+            file: "client.pem",
+            content: &material.client_cert,
+        },
+        NamedPem {
+            file: "client_key.pem",
+            content: &material.client_key,
+        },
     ];
 
     let mut changed = false;
@@ -66,11 +81,17 @@ pub fn ensure_in(base: &Path, material: &TlsMaterial) -> io::Result<Certs> {
 
 /// Path helpers for the kaminari conf strings.
 pub fn server_cert_path() -> String {
-    Path::new(CERTS_DIR).join("server.pem").to_string_lossy().into_owned()
+    Path::new(CERTS_DIR)
+        .join("server.pem")
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn server_key_path() -> String {
-    Path::new(CERTS_DIR).join("server_key.pem").to_string_lossy().into_owned()
+    Path::new(CERTS_DIR)
+        .join("server_key.pem")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -103,7 +124,14 @@ mod tests {
 
     #[test]
     fn writes_once_then_skips_unchanged() {
-        let dir = std::env::temp_dir().join(format!("tyz-agent-certs-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "tyz-agent-certs-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 

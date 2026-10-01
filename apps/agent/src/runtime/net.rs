@@ -14,7 +14,7 @@ use kaminari::{AsyncAccept, AsyncConnect};
 use realm_lb::{BalanceCtx, Token};
 use tokio::net::TcpStream;
 
-use crate::ratelimit::{Pacer, Paced, RateLimiter};
+use crate::ratelimit::{Paced, Pacer, RateLimiter};
 use crate::runtime::zero;
 use crate::stats::{ConnGuard, Counters, TxCounter};
 use crate::translate::{DesiredService, TargetAddr};
@@ -37,13 +37,21 @@ pub struct ConnContext {
 }
 
 /// Terminate TLS on an accepted exit-leg socket (before forwarding starts).
-pub async fn tls_accept(sock: TcpStream, acceptor: &MixAccept) -> io::Result<MixServerStream<TcpStream>> {
+pub async fn tls_accept(
+    sock: TcpStream,
+    acceptor: &MixAccept,
+) -> io::Result<MixServerStream<TcpStream>> {
     let mut hs = vec![0u8; HANDSHAKE_BUF];
     acceptor.accept(sock, &mut hs).await
 }
 
 /// Forward one connection to its end.
-pub async fn handle_conn(client: ClientConn, peer_ip: IpAddr, ctx: Arc<ConnContext>, guard: ConnGuard) {
+pub async fn handle_conn(
+    client: ClientConn,
+    peer_ip: IpAddr,
+    ctx: Arc<ConnContext>,
+    guard: ConnGuard,
+) {
     let name = ctx.service.raw.name.as_str();
     let counters = guard.counters();
     let timeout = ctx.service.connect_timeout;
@@ -60,7 +68,8 @@ pub async fn handle_conn(client: ClientConn, peer_ip: IpAddr, ctx: Arc<ConnConte
     };
     let target: &TargetAddr = &ctx.service.targets[target_idx];
 
-    let result = dial_and_forward(client, target, &ctx, timeout, counters, in_pacer, out_pacer).await;
+    let result =
+        dial_and_forward(client, target, &ctx, timeout, counters, in_pacer, out_pacer).await;
     if let Err(err) = result {
         tracing::debug!(service = name, target = %target, "connection failed: {err}");
         for c in counters {
@@ -75,17 +84,23 @@ pub async fn handle_conn(client: ClientConn, peer_ip: IpAddr, ctx: Arc<ConnConte
 fn sync_client_level(counters: [&Arc<Counters>; 2], a_to_b: u64, b_to_a: u64) {
     counters[1].input_bytes.store(a_to_b, Ordering::Relaxed);
     counters[1].output_bytes.store(b_to_a, Ordering::Relaxed);
-    counters[1].total_conns.store(counters[0].total_conns.load(Ordering::Relaxed), Ordering::Relaxed);
-    counters[1].total_errs.store(counters[0].total_errs.load(Ordering::Relaxed), Ordering::Relaxed);
+    counters[1].total_conns.store(
+        counters[0].total_conns.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+    counters[1].total_errs.store(
+        counters[0].total_errs.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
 }
 
-async fn dial(
-    target: &TargetAddr,
-    timeout: Duration,
-) -> io::Result<TcpStream> {
-    tokio::time::timeout(timeout, TcpStream::connect((target.host.as_str(), target.port)))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))?
+async fn dial(target: &TargetAddr, timeout: Duration) -> io::Result<TcpStream> {
+    tokio::time::timeout(
+        timeout,
+        TcpStream::connect((target.host.as_str(), target.port)),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))?
 }
 
 /// Per-direction pacers for one connection: the service-level buckets plus a
@@ -118,7 +133,8 @@ async fn dial_and_forward(
         // without TLS, single-node direct): the splice zero-copy path.
         ClientConn::Plain(client) if ctx.service.tls.is_none() => {
             let sock = dial(target, timeout).await?;
-            let (a2b, b2a) = zero::bidi_copy_counted(client, sock, up, down, in_pacer, out_pacer).await?;
+            let (a2b, b2a) =
+                zero::bidi_copy_counted(client, sock, up, down, in_pacer, out_pacer).await?;
             sync_client_level(counters, a2b, b2a);
             Ok(())
         }
@@ -132,14 +148,16 @@ async fn dial_and_forward(
             let sock = dial(target, timeout).await?;
             let mut hs = vec![0u8; HANDSHAKE_BUF];
             let tls_stream = connector.connect(sock, &mut hs).await?;
-            let (a2b, b2a) = copy_tls_target(&mut client, tls_stream, up, down, in_pacer, out_pacer).await?;
+            let (a2b, b2a) =
+                copy_tls_target(&mut client, tls_stream, up, down, in_pacer, out_pacer).await?;
             sync_client_level(counters, a2b, b2a);
             Ok(())
         }
         // TLS-terminated client + plain target (exit leg).
         ClientConn::Tls(mut tls_client) => {
             let sock = dial(target, timeout).await?;
-            let (a2b, b2a) = copy_tls_client(&mut tls_client, sock, up, down, in_pacer, out_pacer).await?;
+            let (a2b, b2a) =
+                copy_tls_client(&mut tls_client, sock, up, down, in_pacer, out_pacer).await?;
             sync_client_level(counters, a2b, b2a);
             Ok(())
         }

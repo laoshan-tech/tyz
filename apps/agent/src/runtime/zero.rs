@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::ratelimit::{Pacer, Waiter};
 #[cfg(not(target_os = "linux"))]
 use crate::ratelimit::Paced;
+use crate::ratelimit::{Pacer, Waiter};
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 
@@ -102,7 +102,10 @@ mod imp {
             if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) } < 0 {
                 return Err(io::Error::last_os_error());
             }
-            let pipe = Self { rd: fds[0], wr: fds[1] };
+            let pipe = Self {
+                rd: fds[0],
+                wr: fds[1],
+            };
             // Enlarge to realm's default; failure is non-fatal (kernel cap).
             unsafe {
                 libc::fcntl(pipe.wr, libc::F_SETPIPE_SZ, DEFAULT_PIPE_SIZE);
@@ -212,7 +215,11 @@ mod imp {
                     // until the refill deadline — ordinary backpressure to
                     // the poll loop, bytes never enter userspace.
                     let want = (self.cap - self.pos) as u64;
-                    let grant = if self.pacer.is_empty() { want } else { self.pacer.grant(want) };
+                    let grant = if self.pacer.is_empty() {
+                        want
+                    } else {
+                        self.pacer.grant(want)
+                    };
                     if grant == 0 {
                         let at = self.pacer.ready_at();
                         std::task::ready!(self.waiter.wait_until(cx, at));
@@ -220,8 +227,11 @@ mod imp {
                     }
                     let rd = self.pipe.rd;
                     let wfd = w.as_raw_fd();
-                    let i =
-                        std::task::ready!(w.poll_write_raw(cx, move || splice_n(rd, wfd, grant as usize)))?;
+                    let i = std::task::ready!(w.poll_write_raw(cx, move || splice_n(
+                        rd,
+                        wfd,
+                        grant as usize
+                    )))?;
                     if i == 0 {
                         return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                     }
@@ -432,7 +442,6 @@ mod tests {
         assert!(a2b as usize <= PAYLOAD.len());
     }
 
-
     /// Rate-limited copy: 128KB through a 256KB/s bucket must take real time
     /// (pacing, not a single fast splice) while the payload stays intact.
     #[tokio::test]
@@ -458,9 +467,16 @@ mod tests {
         let out_pacer = Pacer::new(vec![limiter]);
         let mut client_a = client_a;
         let relay = tokio::spawn(async move {
-            bidi_copy_counted(relay_side_client, relay_side_target, up, down, in_pacer, out_pacer)
-                .await
-                .unwrap();
+            bidi_copy_counted(
+                relay_side_client,
+                relay_side_target,
+                up,
+                down,
+                in_pacer,
+                out_pacer,
+            )
+            .await
+            .unwrap();
         });
         let payload = vec![0xABu8; 128 * 1024];
         let mut echo = echo;
@@ -491,7 +507,10 @@ mod tests {
             elapsed >= Duration::from_millis(400),
             "128KB at 256KB/s took only {elapsed:?} — pacing is not enforced"
         );
-        assert!(elapsed < Duration::from_secs(10), "pacing stalled: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "pacing stalled: {elapsed:?}"
+        );
     }
 
     /// Brutal shutdown: a peer that reads EOF but never closes its own side
